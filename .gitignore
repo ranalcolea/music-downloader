@@ -1,0 +1,30 @@
+# Descargas de música
+downloads/
+
+# Historial local
+download-history.json
+
+# Archivos temporales / listas locales
+urls.txt
+
+# Copias de seguridad
+*.bak
+*.bak*
+*.backup
+*.backup*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Entornos virtuales
+venv/
+.venv/
+
+# Logs
+*.log
+
+# Variables y credenciales
+.env
+.env.*
