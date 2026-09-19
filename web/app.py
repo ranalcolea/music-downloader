@@ -2,7 +2,10 @@
 
 import json
 import os
+import csv
+import io
 import subprocess
+import signal
 import threading
 import urllib.parse
 import urllib.request
@@ -16,10 +19,12 @@ HOST = "0.0.0.0"
 PORT = 8080
 
 BASE_DIR = Path("/opt/music-downloader")
-DOWNLOAD_DIR = BASE_DIR / "downloads"
+DOWNLOAD_DIR = Path("/opt/docker/navidrome/music")
+MOBILE_DOWNLOAD_DIR = BASE_DIR / "mobile-downloads"
 TAG_SCRIPT = BASE_DIR / "tag-music.py"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MOBILE_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 downloads = {}
 download_lock = threading.Lock()
@@ -27,9 +32,152 @@ download_lock = threading.Lock()
 download_queue = queue.Queue()
 active_processes = {}
 
+# Control real de descargas:
+# paused    -> descarga pausada mediante SIGSTOP
+# cancelled -> descarga cancelada
+download_controls = {}
+download_control_lock = threading.Lock()
+download_pause_started = {}
+
+
+def get_download_control(job):
+    with download_control_lock:
+        return download_controls.get(job, "")
+
+
+def set_download_control(job, state):
+    with download_control_lock:
+
+        if state:
+
+            download_controls[job] = state
+
+            if state == "paused":
+                download_pause_started[job] = time.time()
+            else:
+                download_pause_started.pop(job, None)
+
+        else:
+
+            download_controls.pop(job, None)
+            download_pause_started.pop(job, None)
+
+
+def clear_download_control(job):
+    with download_control_lock:
+        download_controls.pop(job, None)
+        download_pause_started.pop(job, None)
+
 HISTORY_FILE = BASE_DIR / "download-history.json"
+MOBILE_DOWNLOADS_STATE_FILE = BASE_DIR / "mobile-downloads.json"
 
 history = []
+
+
+def save_mobile_downloads_state():
+
+    try:
+
+        mobile_items = {}
+
+        for job, item in downloads.items():
+
+            if item.get("type") == "mobile":
+
+                mobile_items[job] = {
+                    "job": job,
+                    "status": item.get(
+                        "status",
+                        "unknown"
+                    ),
+                    "message": item.get(
+                        "message",
+                        ""
+                    ),
+                    "progress": item.get(
+                        "progress",
+                        0
+                    ),
+                    "title": item.get(
+                        "title",
+                        ""
+                    ),
+                    "id": item.get(
+                        "id",
+                        ""
+                    ),
+                    "type": "mobile",
+                    "file": item.get(
+                        "file",
+                        ""
+                    ),
+                    "filename": item.get(
+                        "filename",
+                        ""
+                    ),
+                    "size": item.get(
+                        "size",
+                        0
+                    )
+                }
+
+        temp_file = MOBILE_DOWNLOADS_STATE_FILE.with_suffix(
+            ".json.tmp"
+        )
+
+        temp_file.write_text(
+            json.dumps(
+                mobile_items,
+                ensure_ascii=False,
+                indent=2
+            )
+        )
+
+        temp_file.replace(
+            MOBILE_DOWNLOADS_STATE_FILE
+        )
+
+    except Exception as error:
+
+        print(
+            "ERROR guardando estado de descargas móviles:",
+            repr(error)
+        )
+
+
+def load_mobile_downloads_state():
+
+    try:
+
+        if not MOBILE_DOWNLOADS_STATE_FILE.exists():
+            return
+
+        loaded = json.loads(
+            MOBILE_DOWNLOADS_STATE_FILE.read_text()
+        )
+
+        if not isinstance(loaded, dict):
+            return
+
+        for job, item in loaded.items():
+
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("type") != "mobile":
+                continue
+
+            downloads[job] = item
+
+    except Exception as error:
+
+        print(
+            "ERROR cargando estado de descargas móviles:",
+            repr(error)
+        )
+
+
+load_mobile_downloads_state()
 
 try:
     if HISTORY_FILE.exists():
@@ -60,6 +208,141 @@ def save_history():
 
 def add_history(job, video_id, title=""):
 
+    item = downloads.get(
+        job,
+        {}
+    )
+
+    download_type = item.get(
+        "type",
+        "navidrome"
+    )
+
+    history_type = (
+        "mobile"
+        if download_type == "mobile"
+        else "navidrome"
+    )
+
+    album_group = item.get(
+        "album_group"
+    )
+
+    # Los álbumes tienen varios jobs independientes,
+    # pero aparecen como una sola entrada en el historial.
+    if album_group:
+
+        group_items = [
+            (group_job, group_item)
+            for group_job, group_item in downloads.items()
+            if group_item.get("album_group") == album_group
+        ]
+
+        if not group_items:
+            return
+
+        terminal_states = {
+            "done",
+            "cancelled",
+            "error"
+        }
+
+        # Esperar hasta que todos los temas del álbum
+        # hayan llegado a un estado final.
+        if any(
+                group_item.get("status") not in terminal_states
+                for _, group_item in group_items
+        ):
+            return
+
+        # Evitar duplicados.
+        history[:] = [
+            entry
+            for entry in history
+            if entry.get("album_group") != album_group
+        ]
+
+        ordered_items = sorted(
+            group_items,
+            key=lambda pair: (
+                pair[1].get("album_track_index", 0),
+                pair[0]
+            )
+        )
+
+        tracks = []
+
+        for group_job, group_item in ordered_items:
+            tracks.append({
+                "job": group_job,
+                "id": group_item.get(
+                    "id",
+                    ""
+                ),
+                "title": group_item.get(
+                    "title",
+                    group_item.get(
+                        "id",
+                        ""
+                    )
+                ),
+                "track_index": group_item.get(
+                    "album_track_index",
+                    0
+                ),
+                "status": group_item.get(
+                    "status",
+                    "error"
+                ),
+                "progress": group_item.get(
+                    "progress",
+                    0
+                )
+            })
+
+        if all(
+                track["status"] == "done"
+                for track in tracks
+        ):
+            group_status = "done"
+
+        elif any(
+                track["status"] == "error"
+                for track in tracks
+        ):
+            group_status = "error"
+
+        else:
+            group_status = "cancelled"
+
+        album_title = (
+            item.get("album_title")
+            or "Álbum"
+        )
+
+        history.append({
+            "job": album_group,
+            "id": album_group,
+            "title": album_title,
+            "time": time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "status": group_status,
+            "type": history_type,
+            "album_group": album_group,
+            "album_title": album_title,
+            "album_track_total": item.get(
+                "album_track_total",
+                len(tracks)
+            ),
+            "tracks": tracks
+        })
+
+        save_history()
+        return
+
+    # Las canciones individuales mantienen
+    # exactamente el historial anterior.
     history.append({
         "job": job,
         "id": video_id,
@@ -67,31 +350,315 @@ def add_history(job, video_id, title=""):
         "time": time.strftime(
             "%Y-%m-%d %H:%M:%S"
         ),
-        "status": downloads.get(
-            job,
-            {}
-        ).get(
+        "status": item.get(
             "status",
             "done"
-        )
+        ),
+        "type": history_type
     })
 
     save_history()
+
+
+def pause_download(job):
+
+    process = active_processes.get(job)
+
+    if process is None:
+        return False, "La descarga todavía no está activa."
+
+    if process.poll() is not None:
+        return False, "La descarga ya ha terminado."
+
+    try:
+
+        process.send_signal(signal.SIGSTOP)
+
+        set_download_control(job, "paused")
+
+        if job in downloads:
+
+            downloads[job]["status"] = "paused"
+            downloads[job]["message"] = "Descarga pausada."
+
+            if downloads[job].get("type") == "mobile":
+                save_mobile_downloads_state()
+
+        return True, "Descarga pausada."
+
+    except Exception as error:
+
+        return False, str(error)
+
+
+def resume_download(job):
+
+    process = active_processes.get(job)
+
+    if process is None:
+
+        # Puede tratarse de un trabajo que todavía está
+        # esperando en la cola.
+        if get_download_control(job) == "paused":
+
+            set_download_control(job, "")
+
+            if job in downloads:
+
+                downloads[job]["status"] = "queued"
+                downloads[job]["message"] = "En cola..."
+
+                if downloads[job].get("type") == "mobile":
+                    save_mobile_downloads_state()
+
+            return True, "Descarga reanudada en cola."
+
+        return False, "La descarga no está activa."
+
+
+    if process.poll() is not None:
+
+        return False, "La descarga ya ha terminado."
+
+
+    try:
+
+        process.send_signal(signal.SIGCONT)
+
+        set_download_control(job, "")
+
+        if job in downloads:
+
+            downloads[job]["status"] = "running"
+            downloads[job]["message"] = "Descargando..."
+
+            if downloads[job].get("type") == "mobile":
+                save_mobile_downloads_state()
+
+        return True, "Descarga reanudada."
+
+    except Exception as error:
+
+        return False, str(error)
+
+
+def cancel_download(job):
+
+    process = active_processes.get(job)
+
+    # Cancelación de un trabajo que todavía está en cola.
+    if process is None:
+
+        if job in downloads and downloads[job].get("status") in (
+            "queued",
+            "paused"
+        ):
+
+            set_download_control(job, "cancelled")
+
+            item = downloads[job]
+
+            item["status"] = "cancelled"
+            item["message"] = "Descarga cancelada."
+
+            add_history(
+                job,
+                item.get("id", ""),
+                item.get("title", "")
+            )
+
+            if item.get("type") == "mobile":
+                save_mobile_downloads_state()
+
+            return True, "Descarga cancelada."
+
+        return False, "La descarga no está activa."
+
+
+    try:
+
+        # Si estaba pausado, SIGTERM por sí solo no puede
+        # despertarlo. Primero lo reanudamos y después
+        # terminamos el proceso.
+        if get_download_control(job) == "paused":
+
+            try:
+                process.send_signal(signal.SIGCONT)
+            except Exception:
+                pass
+
+        set_download_control(job, "cancelled")
+
+        process.terminate()
+
+        if job in downloads:
+
+            item = downloads[job]
+
+            item["status"] = "cancelled"
+            item["message"] = "Descarga cancelada."
+
+            if not item.get("type"):
+                item["type"] = "navidrome"
+
+            if item.get("type") == "mobile":
+                save_mobile_downloads_state()
+
+        return True, "Descarga cancelada."
+
+    except Exception as error:
+
+        return False, str(error)
 
 
 def queue_worker():
 
     while True:
 
-        job, video_id, title = download_queue.get()
+        item = download_queue.get()
 
         try:
 
-            do_download(
-                job,
-                video_id,
-                title
-            )
+            # Descarga móvil.
+            #
+            # Formato antiguo:
+            # (job, video_id, title, "mobile")
+            #
+            # Formato con álbum:
+            # (
+            #     job,
+            #     video_id,
+            #     title,
+            #     "mobile",
+            #     album_group,
+            #     album_title,
+            #     album_track_index,
+            #     album_track_total
+            # )
+
+            if len(item) >= 4 and item[3] == "mobile":
+
+                job = item[0]
+                video_id = item[1]
+                title = item[2]
+
+                album_group = (
+                    item[4]
+                    if len(item) > 4
+                    else None
+                )
+
+                album_title = (
+                    item[5]
+                    if len(item) > 5
+                    else None
+                )
+
+                album_track_index = (
+                    item[6]
+                    if len(item) > 6
+                    else 0
+                )
+
+                album_track_total = (
+                    item[7]
+                    if len(item) > 7
+                    else 0
+                )
+
+                if get_download_control(job) == "paused":
+
+                    downloads[job]["status"] = "paused"
+                    downloads[job]["message"] = (
+                        "En pausa. Esperando reanudación."
+                    )
+
+                    save_mobile_downloads_state()
+
+                    download_queue.put(item)
+
+                    time.sleep(0.5)
+
+                    continue
+
+                do_download_mobile(
+                    job,
+                    video_id,
+                    title,
+                    album_group,
+                    album_title,
+                    album_track_index,
+                    album_track_total
+                )
+
+            else:
+
+                # Navidrome.
+                #
+                # Formato antiguo:
+                # (job, video_id, title)
+                #
+                # Formato con álbum:
+                # (
+                #     job,
+                #     video_id,
+                #     title,
+                #     album_group,
+                #     album_title,
+                #     album_track_index,
+                #     album_track_total
+                # )
+
+                job = item[0]
+                video_id = item[1]
+                title = item[2]
+
+                album_group = (
+                    item[3]
+                    if len(item) > 3
+                    else None
+                )
+
+                album_title = (
+                    item[4]
+                    if len(item) > 4
+                    else None
+                )
+
+                album_track_index = (
+                    item[5]
+                    if len(item) > 5
+                    else 0
+                )
+
+                album_track_total = (
+                    item[6]
+                    if len(item) > 6
+                    else 0
+                )
+
+                if get_download_control(job) == "paused":
+
+                    downloads[job]["status"] = "paused"
+                    downloads[job]["message"] = (
+                        "En pausa. Esperando reanudación."
+                    )
+
+                    download_queue.put(item)
+
+                    time.sleep(0.5)
+
+                    continue
+
+                do_download(
+                    job,
+                    video_id,
+                    title,
+                    album_group,
+                    album_title,
+                    album_track_index,
+                    album_track_total
+                )
 
         finally:
 
@@ -1944,6 +2511,327 @@ button {
     display: block;
 }
 
+
+/* =========================================================
+   REPRODUCTOR FLOTANTE DE LISTA SPOTIFY
+========================================================= */
+
+.spotify-floating-player {
+    position: fixed !important;
+
+    left: 18px;
+    right: 18px;
+    bottom: 18px;
+
+    z-index: 9999;
+
+    display: grid;
+    grid-template-columns: minmax(180px, 1fr);
+
+    gap: 10px;
+
+    padding: 16px 20px;
+
+    border-radius: 18px;
+
+    background:
+        linear-gradient(
+            135deg,
+            rgba(25,25,35,.97),
+            rgba(12,14,20,.98)
+        );
+
+    border: 1px solid rgba(255,255,255,.12);
+
+    box-shadow:
+        0 15px 50px rgba(0,0,0,.45),
+        0 0 0 1px rgba(255,255,255,.025);
+
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+
+    color: white;
+}
+
+.spotify-floating-player .player-info {
+    min-width: 0;
+
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    font-size: 14px;
+    font-weight: 750;
+
+    padding-right: 25px;
+}
+
+.spotify-floating-info {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    gap: 12px;
+
+    min-width: 0;
+}
+
+.spotify-floating-position {
+    flex-shrink: 0;
+
+    font-size: 12px;
+    font-weight: 700;
+
+    opacity: .65;
+}
+
+/* ---------------------------------------------------------
+   BARRA DE PROGRESO
+--------------------------------------------------------- */
+
+.spotify-floating-progress {
+    display: flex;
+    align-items: center;
+
+    width: 100%;
+
+    gap: 10px;
+
+    margin-top: 2px;
+}
+
+.spotify-time-current,
+.spotify-time-duration {
+    width: 38px;
+
+    flex-shrink: 0;
+
+    font-size: 11px;
+    font-weight: 700;
+
+    opacity: .7;
+
+    text-align: center;
+}
+
+.spotify-progress {
+    appearance: none;
+    -webkit-appearance: none;
+
+    flex: 1;
+
+    width: 100%;
+    height: 6px;
+
+    margin: 0;
+
+    padding: 0;
+
+    border-radius: 10px;
+
+    background: rgba(255,255,255,.18);
+
+    cursor: pointer;
+
+    outline: none;
+}
+
+/* Barra WebKit */
+
+.spotify-progress::-webkit-slider-runnable-track {
+    height: 6px;
+
+    border-radius: 10px;
+
+    background: rgba(255,255,255,.18);
+}
+
+.spotify-progress::-webkit-slider-thumb {
+    appearance: none;
+    -webkit-appearance: none;
+
+    width: 14px;
+    height: 14px;
+
+    margin-top: -4px;
+
+    border-radius: 50%;
+
+    background: #ffffff;
+
+    border: 0;
+
+    box-shadow:
+        0 2px 8px rgba(0,0,0,.35);
+
+    cursor: pointer;
+}
+
+/* Barra Firefox */
+
+.spotify-progress::-moz-range-track {
+    height: 6px;
+
+    border-radius: 10px;
+
+    background: rgba(255,255,255,.18);
+}
+
+.spotify-progress::-moz-range-progress {
+    height: 6px;
+
+    border-radius: 10px;
+
+    background: rgba(255,255,255,.85);
+}
+
+.spotify-progress::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+
+    border-radius: 50%;
+
+    background: #ffffff;
+
+    border: 0;
+
+    cursor: pointer;
+}
+
+.spotify-progress:hover::-webkit-slider-thumb {
+    transform: scale(1.15);
+}
+
+.spotify-progress:focus::-webkit-slider-thumb {
+    transform: scale(1.15);
+}
+
+/* ---------------------------------------------------------
+   CONTROLES
+--------------------------------------------------------- */
+
+.spotify-floating-controls {
+    display: flex;
+
+    align-items: center;
+    justify-content: center;
+
+    gap: 12px;
+
+    margin-top: 2px;
+}
+
+.spotify-floating-control {
+    width: 42px;
+    height: 42px;
+
+    border-radius: 50%;
+
+    border: 1px solid rgba(255,255,255,.12);
+
+    background: rgba(255,255,255,.08);
+
+    color: white;
+
+    font-size: 18px;
+
+    cursor: pointer;
+
+    transition:
+        transform .15s ease,
+        background .15s ease;
+}
+
+.spotify-floating-control:hover {
+    transform: scale(1.06);
+
+    background: rgba(255,255,255,.15);
+}
+
+.spotify-floating-main {
+    width: 48px;
+    height: 48px;
+
+    font-size: 20px;
+
+    background: rgba(255,255,255,.16);
+}
+
+.spotify-floating-close {
+    position: absolute;
+
+    top: 8px;
+    right: 10px;
+
+    width: 28px;
+    height: 28px;
+
+    border: 0;
+
+    border-radius: 50%;
+
+    background: rgba(255,255,255,.07);
+
+    color: rgba(255,255,255,.75);
+
+    font-size: 20px;
+
+    line-height: 1;
+
+    cursor: pointer;
+}
+
+.spotify-floating-close:hover {
+    background: rgba(255,255,255,.14);
+
+    color: white;
+}
+
+/* El audio nativo no hace falta mostrarlo */
+
+.spotify-floating-player audio {
+    display: none !important;
+}
+
+/* ========================================================= */
+
+
+.spotify-download-status {
+    min-height: 18px;
+}
+
+.spotify-download-status-loading {
+    color: #f0ad4e;
+}
+
+.spotify-download-status-progress {
+    color: #4dabf7;
+}
+
+.spotify-download-status-success {
+    color: #35c759;
+}
+
+.spotify-download-status-error {
+    color: #ff4d4f;
+}
+
+.spotify-download-progress {
+    width: 100%;
+    height: 5px;
+    margin-top: 6px;
+    overflow: hidden;
+    border-radius: 10px;
+    background: rgba(255,255,255,.12);
+}
+
+.spotify-download-progress > div {
+    height: 100%;
+    border-radius: 10px;
+    background: #35c759;
+    transition: width .3s ease;
+}
+
 /* Botón principal de escuchar álbum */
 
 .album-album-play {
@@ -2143,6 +3031,34 @@ button {
     outline: none !important;
     border-color: rgba(124,92,255,.55) !important;
     box-shadow: 0 0 0 3px rgba(124,92,255,.12) !important;
+}
+
+
+@media (max-width: 600px) {
+    .spotify-saved-item {
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+        overflow: hidden;
+    }
+
+    .spotify-saved-info {
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+    }
+
+    .spotify-saved-name {
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .spotify-saved-actions {
+        flex-shrink: 0;
+    }
 }
 
 </style>
@@ -3096,6 +4012,245 @@ button {
 }
 </style>
 
+
+
+<style>
+
+.spotify-card {
+    margin-top: 22px;
+}
+
+.spotify-import {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.spotify-file-label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: fit-content;
+    min-height: 44px;
+    padding: 0 18px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-weight: 800;
+    background: var(--accent);
+    color: white;
+    transition: transform .15s ease, opacity .15s ease;
+}
+
+.spotify-file-label:hover {
+    transform: translateY(-1px);
+    opacity: .92;
+}
+
+.spotify-info {
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255,255,255,.035);
+}
+
+.spotify-info strong {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.spotify-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+
+.spotify-saved-lists {
+    margin-top: 18px;
+    margin-bottom: 18px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255,255,255,.025);
+}
+
+.spotify-saved-title {
+    font-weight: 800;
+    margin-bottom: 10px;
+}
+
+.spotify-saved-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.spotify-saved-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(255,255,255,.025);
+}
+
+.spotify-saved-info {
+    min-width: 0;
+}
+
+.spotify-saved-name {
+    font-weight: 750;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.spotify-saved-meta {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.spotify-saved-actions {
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.spotify-saved-empty {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+@media (max-width: 700px) {
+    .spotify-saved-item {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .spotify-saved-actions {
+        justify-content: flex-start;
+    }
+}
+
+
+.spotify-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.spotify-track {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 13px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255,255,255,.025);
+}
+
+.spotify-track:hover {
+    background: rgba(255,255,255,.045);
+}
+
+.spotify-check {
+    width: 20px;
+    height: 20px;
+    cursor: pointer;
+}
+
+.spotify-track-info {
+    min-width: 0;
+}
+
+.spotify-track-title {
+    font-weight: 750;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.spotify-track-meta {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.spotify-number {
+    color: var(--muted);
+    font-size: 12px;
+    text-align: right;
+}
+
+
+.spotify-track-player {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+
+.spotify-track-player .btn {
+    min-height: 34px;
+    padding: 7px 12px;
+    font-size: 12px;
+}
+
+@media (max-width: 600px) {
+
+    .spotify-track-player {
+        width: 100%;
+    }
+
+    .spotify-track-player .btn {
+        flex: 1;
+        min-width: 100px;
+    }
+
+}
+
+.spotify-playing {
+    border-color: var(--accent) !important;
+    background: rgba(255,255,255,.07) !important;
+}
+
+.spotify-status {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+@media (max-width: 600px) {
+
+    .spotify-track {
+        grid-template-columns: 30px minmax(0, 1fr);
+        gap: 9px;
+    }
+
+    .spotify-number {
+        display: none;
+    }
+
+    .spotify-actions {
+        flex-direction: column;
+    }
+
+    .spotify-actions button {
+        width: 100%;
+    }
+
+}
+
+</style>
+
+
 </head>
 
 <body>
@@ -3152,6 +4307,119 @@ button {
         </button>
 
     </div>
+
+
+
+    <section class="card spotify-card">
+
+        <div class="card-header">
+
+            <div>
+
+                <div class="card-title">
+                    🎵 Spotify
+                </div>
+
+                <div class="card-subtitle">
+                    Importa tus playlists en CSV, TXT o JSON
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="spotify-import">
+
+            <label
+                class="spotify-file-label"
+                for="spotifyFile">
+
+                📂 Seleccionar playlist
+
+            </label>
+
+            <input
+                id="spotifyFile"
+                type="file"
+                accept=".csv,.txt,.json,text/csv,text/plain,application/json"
+                style="display:none"
+                onchange="importSpotifyFile(this)"
+            >
+
+            <div
+                id="spotifyInfo"
+                class="spotify-info"
+                style="display:none">
+            </div>
+
+            <div class="spotify-actions">
+
+                <button
+                    class="btn preview"
+                    onclick="window.open('https://exportify.net/', '_blank', 'noopener,noreferrer')">
+                    🌐 Abrir Exportify
+                </button>
+
+            </div>
+
+            <div
+                id="spotifyActions"
+                class="spotify-actions"
+                style="display:none">
+
+                <button
+                    class="btn preview"
+                    onclick="spotifySelectAll()">
+                    ☑ Seleccionar todas
+                </button>
+
+                <button
+                    class="btn download"
+                    onclick="spotifyDownloadSelected()">
+                    ↓ Descargar seleccionadas
+                </button>
+
+                <button
+                    class="btn preview"
+                    onclick="spotifyPlayPlaylist()">
+                    ▶ Escuchar lista
+                </button>
+
+                <button
+                    class="btn cancel"
+                    onclick="spotifyStopPlaylist()">
+                    ⏹ Parar lista
+                </button>
+
+            </div>
+
+            <div class="spotify-saved-lists">
+
+                <div class="spotify-saved-title">
+                    📚 Mis listas guardadas
+                </div>
+
+                <div
+                    id="spotifySavedLists"
+                    class="spotify-saved-list">
+                </div>
+
+            </div>
+
+
+            <div
+                id="spotifyList"
+                class="spotify-list">
+            </div>
+
+            <div
+                id="spotifyStatus"
+                class="spotify-status">
+            </div>
+
+        </div>
+
+    </section>
 
     <div
         id="results"
@@ -6843,6 +8111,1954 @@ window.albumDownloadAll = async function() {
 })();
 </script>
 
+
+<script>
+
+let spotifyPlaylist = null;
+
+
+function spotifyEscape(value) {
+
+    return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+
+function spotifyFormatDuration(value) {
+
+    let ms = parseInt(value || 0);
+
+    if (!ms) {
+        return "";
+    }
+
+    if (ms > 100000) {
+        ms = Math.round(ms / 1000) * 1000;
+    }
+
+    const seconds = Math.floor(ms / 1000);
+
+    const min = Math.floor(seconds / 60);
+
+    const sec = String(
+        seconds % 60
+    ).padStart(2, "0");
+
+    return min + ":" + sec;
+}
+
+
+
+async function loadSpotifySavedLists() {
+
+    const container =
+        document.getElementById("spotifySavedLists");
+
+    if (!container) {
+        return;
+    }
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/spotify/lists",
+                {
+                    cache: "no-store"
+                }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error ||
+                "No se pudieron cargar las listas."
+            );
+        }
+
+        const lists = data.lists || [];
+
+        if (!lists.length) {
+
+            container.innerHTML =
+                "<div class='spotify-saved-empty'>" +
+                "No hay playlists guardadas todavía." +
+                "</div>";
+
+            return;
+        }
+
+        container.innerHTML = "";
+
+        lists.forEach(function(playlist) {
+
+            const item =
+                document.createElement("div");
+
+            item.className =
+                "spotify-saved-item";
+
+            const date =
+                playlist.created_at
+                    ? new Date(
+                        playlist.created_at
+                    ).toLocaleString("es-ES")
+                    : "";
+
+            item.innerHTML = `
+                <div class="spotify-saved-info">
+                    <div class="spotify-saved-name">
+                        🎵 ${spotifyEscape(playlist.name)}
+                    </div>
+                    <div class="spotify-saved-meta">
+                        ${(playlist.count || 0)} canciones
+                        ${date ? " • " + spotifyEscape(date) : ""}
+                    </div>
+                </div>
+
+                <div class="spotify-saved-actions">
+                    <button
+                        type="button"
+                        class="btn preview spotify-load-saved">
+                        ▶ Cargar
+                    </button>
+
+                    <button
+                        type="button"
+                        class="btn cancel spotify-delete-saved">
+                        🗑️ Eliminar
+                    </button>
+                </div>
+            `;
+
+            const loadButton =
+                item.querySelector(
+                    ".spotify-load-saved"
+                );
+
+            const deleteButton =
+                item.querySelector(
+                    ".spotify-delete-saved"
+                );
+
+            loadButton.addEventListener(
+                "click",
+                function() {
+                    loadSpotifySavedList(
+                        playlist.id
+                    );
+                }
+            );
+
+            deleteButton.addEventListener(
+                "click",
+                function() {
+                    deleteSpotifySavedList(
+                        playlist.id,
+                        playlist.name
+                    );
+                }
+            );
+
+            container.appendChild(item);
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Error cargando listas Spotify:",
+            error
+        );
+
+        container.innerHTML =
+            "<div class='spotify-saved-empty'>" +
+            "❌ No se pudo cargar el historial." +
+            "</div>";
+    }
+}
+
+
+async function loadSpotifySavedList(id) {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/spotify/list/load",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body: JSON.stringify({
+                        id: id
+                    })
+                }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error ||
+                "No se pudo cargar la playlist."
+            );
+        }
+
+        spotifyPlaylist =
+            data.playlist;
+
+        const info =
+            document.getElementById(
+                "spotifyInfo"
+            );
+
+        const actions =
+            document.getElementById(
+                "spotifyActions"
+            );
+
+        const status =
+            document.getElementById(
+                "spotifyStatus"
+            );
+
+        info.style.display =
+            "block";
+
+        info.innerHTML = `
+            <strong>
+                🎵 ${spotifyEscape(
+                    spotifyPlaylist.name
+                )}
+            </strong>
+            ${spotifyPlaylist.count || spotifyPlaylist.tracks.length}
+            canciones
+        `;
+
+        renderSpotifyPlaylist();
+
+        actions.style.display =
+            "flex";
+
+        status.innerText =
+            "📚 Playlist cargada desde el historial.";
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+    }
+}
+
+
+async function deleteSpotifySavedList(
+    id,
+    name
+) {
+
+    if (
+        !confirm(
+            '¿Eliminar la playlist "' +
+            name +
+            '" del historial?'
+        )
+    ) {
+        return;
+    }
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/spotify/list/delete",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body: JSON.stringify({
+                        id: id
+                    })
+                }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.error ||
+                "No se pudo eliminar la playlist."
+            );
+        }
+
+        loadSpotifySavedLists();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+    }
+}
+
+
+async function importSpotifyFile(input) {
+
+    const file = input.files[0];
+
+    if (!file) {
+        return;
+    }
+
+    const info =
+        document.getElementById("spotifyInfo");
+
+    const list =
+        document.getElementById("spotifyList");
+
+    const actions =
+        document.getElementById("spotifyActions");
+
+    const status =
+        document.getElementById("spotifyStatus");
+
+    info.style.display = "block";
+
+    info.innerHTML =
+        "⏳ Leyendo playlist...";
+
+    list.innerHTML = "";
+
+    actions.style.display = "none";
+
+    status.innerText = "";
+
+    try {
+
+        const content =
+            await file.text();
+
+        const response =
+            await fetch(
+                "/api/spotify/import",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body: JSON.stringify({
+                        filename: file.name,
+                        content: content
+                    })
+                }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "No se pudo importar la playlist."
+            );
+        }
+
+        spotifyPlaylist = data;
+
+        info.innerHTML = `
+            <strong>
+                🎵 ${spotifyEscape(data.name)}
+            </strong>
+            ${data.count} canciones
+        `;
+
+        renderSpotifyPlaylist();
+
+        actions.style.display =
+            "flex";
+
+        status.innerText =
+            "Selecciona las canciones que quieras descargar.";
+
+        loadSpotifySavedLists();
+
+    } catch (error) {
+
+        spotifyPlaylist = null;
+
+        info.innerHTML =
+            "❌ " +
+            spotifyEscape(
+                error.message
+            );
+
+        list.innerHTML = "";
+
+        actions.style.display =
+            "none";
+
+    }
+
+    input.value = "";
+}
+
+
+function renderSpotifyPlaylist() {
+
+    const list =
+        document.getElementById(
+            "spotifyList"
+        );
+
+    if (
+        !spotifyPlaylist ||
+        !spotifyPlaylist.tracks ||
+        !spotifyPlaylist.tracks.length
+    ) {
+
+        list.innerHTML =
+            "<div class='empty'>No hay canciones.</div>";
+
+        return;
+    }
+
+    list.innerHTML = "";
+
+    spotifyPlaylist.tracks.forEach(
+        function(track, index) {
+
+            const div =
+                document.createElement("div");
+
+            div.className =
+                "spotify-track";
+
+            const artist =
+                track.artist || "";
+
+            const album =
+                track.album || "";
+
+            const metaParts = [];
+
+            if (artist) {
+                metaParts.push(artist);
+            }
+
+            if (album) {
+                metaParts.push(album);
+            }
+
+            const duration =
+                spotifyFormatDuration(
+                    track.duration
+                );
+
+            if (duration) {
+                metaParts.push(
+                    "⏱️ " + duration
+                );
+            }
+
+            div.innerHTML = `
+
+                <input
+                    class="spotify-check"
+                    type="checkbox"
+                    data-index="${index}"
+                    checked
+                >
+
+                <div class="spotify-track-info">
+
+                    <div class="spotify-track-title">
+                        ${spotifyEscape(track.title)}
+                    </div>
+
+                    <div class="spotify-track-meta">
+                        ${spotifyEscape(
+                            metaParts.join(" • ")
+                        )}
+                    </div>
+
+                    <div
+                        class="spotify-download-status"
+                        style="margin-top:10px; font-size:13px; font-weight:700;">
+                    </div>
+
+                    <div
+                        class="spotify-track-player"
+                        style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+
+                        <button
+                            type="button"
+                            class="btn preview spotify-play"
+                            data-index="${index}">
+                            ▶ Escuchar
+                        </button>
+
+                        <button
+                            type="button"
+                            class="btn cancel spotify-stop"
+                            data-index="${index}">
+                            ⏹ Parar
+                        </button>
+
+                        <button
+                            type="button"
+                            class="btn download spotify-download"
+                            data-index="${index}">
+                            ↓ Descargar
+                        </button>
+
+                    </div>
+
+                </div>
+
+                <div class="spotify-number">
+                    ${index + 1}
+                </div>
+
+            `;
+
+            const playButton =
+                div.querySelector(".spotify-play");
+
+            const stopButton =
+                div.querySelector(".spotify-stop");
+
+            const downloadButton =
+                div.querySelector(".spotify-download");
+
+            playButton.addEventListener(
+                "click",
+                function() {
+                    spotifyPlayTrack(
+                        track,
+                        div,
+                        playButton
+                    );
+                }
+            );
+
+            stopButton.addEventListener(
+                "click",
+                function() {
+                    stopPreview();
+                }
+            );
+
+            downloadButton.addEventListener(
+                "click",
+                async function() {
+
+                    downloadButton.disabled = true;
+                    downloadButton.innerText =
+                        "⏳ Buscando...";
+
+                    try {
+
+                        const response =
+                            await fetch(
+                                "/api/spotify/download",
+                                {
+                                    method: "POST",
+                                    headers: {
+                                        "Content-Type":
+                                            "application/json"
+                                    },
+                                    body: JSON.stringify({
+                                        tracks: [track]
+                                    })
+                                }
+                            );
+
+                        const data =
+                            await response.json();
+
+                        if (!response.ok) {
+                            throw new Error(
+                                data.error ||
+                                "No se pudo descargar."
+                            );
+                        }
+
+                        if (
+                            data.errors &&
+                            data.errors.length
+                        ) {
+                            throw new Error(
+                                data.errors[0].error ||
+                                "No se pudo encontrar la canción."
+                            );
+                        }
+
+                        downloadButton.innerText =
+                            "✓ En cola";
+
+                        const queuedJob =
+                            data.queued &&
+                            data.queued.length
+                                ? data.queued[0].job
+                                : null;
+
+                        if (queuedJob) {
+
+                            spotifyWatchDownload(
+                                queuedJob,
+                                div
+                            );
+                        }
+
+                    } catch (error) {
+
+                        downloadButton.innerText =
+                            "❌ Error";
+
+                        alert(error.message);
+
+                        setTimeout(
+                            function() {
+                                downloadButton.innerText =
+                                    "↓ Descargar";
+                                downloadButton.disabled =
+                                    false;
+                            },
+                            2500
+                        );
+
+                        return;
+                    }
+
+                    setTimeout(
+                        function() {
+                            downloadButton.innerText =
+                                "↓ Descargar";
+                            downloadButton.disabled =
+                                false;
+                        },
+                        2500
+                    );
+                }
+            );
+
+            list.appendChild(div);
+
+        }
+    );
+}
+
+
+let spotifyPlayback = {
+    active: false,
+    index: -1,
+    tracks: []
+};
+
+
+function spotifyStopPlaylist() {
+
+    spotifyPlayback.active = false;
+    spotifyPlayback.index = -1;
+    spotifyPlayback.tracks = [];
+
+    stopPreview();
+
+    const status =
+        document.getElementById(
+            "spotifyStatus"
+        );
+
+    if (status) {
+        status.innerText =
+            "⏹ Reproducción detenida.";
+    }
+}
+
+
+async function spotifyPlayPlaylist() {
+
+    if (
+        !spotifyPlaylist ||
+        !spotifyPlaylist.tracks ||
+        !spotifyPlaylist.tracks.length
+    ) {
+
+        alert(
+            "No hay canciones en la lista."
+        );
+
+        return;
+    }
+
+    spotifyStopPlaylist();
+
+    spotifyPlayback.tracks =
+        spotifyPlaylist.tracks.slice();
+
+    spotifyPlayback.active = true;
+    spotifyPlayback.index = 0;
+
+    await spotifyPlayIndex(0);
+}
+
+
+async function spotifyPlayIndex(index) {
+
+    if (!spotifyPlayback.active) {
+        return;
+    }
+
+    const tracks =
+        spotifyPlayback.tracks;
+
+    if (
+        !tracks ||
+        index < 0 ||
+        index >= tracks.length
+    ) {
+
+        spotifyPlayback.active = false;
+        spotifyPlayback.index = -1;
+
+        stopPreview();
+
+        const status =
+            document.getElementById(
+                "spotifyStatus"
+            );
+
+        if (status) {
+            status.innerText =
+                "✅ Lista terminada.";
+        }
+
+        return;
+    }
+
+    spotifyPlayback.index = index;
+
+    const track =
+        tracks[index];
+
+    const rows =
+        document.querySelectorAll(
+            ".spotify-track"
+        );
+
+    rows.forEach(
+        function(row) {
+
+            row.classList.remove(
+                "spotify-playing"
+            );
+
+        }
+    );
+
+    const row =
+        rows[index];
+
+    if (row) {
+
+        row.classList.add(
+            "spotify-playing"
+        );
+
+    }
+
+    const playButton =
+        row
+            ? row.querySelector(
+                ".spotify-play"
+            )
+            : null;
+
+    await spotifyPlayTrack(
+        track,
+        row,
+        playButton,
+        true
+    );
+}
+
+
+
+function spotifyPlayerPrev() {
+
+    if (!spotifyPlayback.active) return;
+
+    const prev = spotifyPlayback.index - 1;
+
+    if (prev < 0) {
+        spotifyPlayback.index = 0;
+        return;
+    }
+
+    spotifyPlayIndex(prev);
+}
+
+
+function spotifyPlayerNext() {
+
+    if (!spotifyPlayback.active) return;
+
+    const next = spotifyPlayback.index + 1;
+
+    if (next >= spotifyPlayback.tracks.length) {
+        spotifyPlayback.active = false;
+        spotifyPlayback.index = -1;
+        stopPreview();
+
+        const status =
+            document.getElementById("spotifyStatus");
+
+        if (status) {
+            status.innerText = "✅ Lista terminada.";
+        }
+
+        return;
+    }
+
+    spotifyPlayIndex(next);
+}
+
+
+function spotifyPlayerToggle() {
+
+    const player =
+        spotifyPlayback.player;
+
+    if (!player) return;
+
+    const audio =
+        player.querySelector("audio");
+
+    if (!audio) return;
+
+    if (audio.paused) {
+        audio.play().catch(() => {});
+    } else {
+        audio.pause();
+    }
+}
+
+
+function spotifyPlayerClose() {
+
+    spotifyPlayback.active = false;
+    spotifyPlayback.index = -1;
+
+    const player =
+        spotifyPlayback.player;
+
+    if (player) {
+        player.remove();
+    }
+
+    spotifyPlayback.player = null;
+    spotifyPlayback.audio = null;
+
+    stopPreview();
+
+    const status =
+        document.getElementById("spotifyStatus");
+
+    if (status) {
+        status.innerText = "⏹ Reproductor cerrado.";
+    }
+}
+
+
+function enableSpotifyPlayerDrag(player) {
+
+    if (!player) {
+        return;
+    }
+
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    player.addEventListener("pointerdown", function(e) {
+
+        if (
+            e.target.closest("button") ||
+            e.target.closest("input") ||
+            e.target.closest("audio")
+        ) {
+            return;
+        }
+
+        const rect =
+            player.getBoundingClientRect();
+
+        dragging = true;
+
+        offsetX =
+            e.clientX - rect.left;
+
+        offsetY =
+            e.clientY - rect.top;
+
+        player.style.left =
+            rect.left + "px";
+
+        player.style.top =
+            rect.top + "px";
+
+        player.style.right =
+            "auto";
+
+        player.style.bottom =
+            "auto";
+
+        player.setPointerCapture(
+            e.pointerId
+        );
+    });
+
+    player.addEventListener("pointermove", function(e) {
+
+        if (!dragging) {
+            return;
+        }
+
+        let x =
+            e.clientX - offsetX;
+
+        let y =
+            e.clientY - offsetY;
+
+        const maxX =
+            window.innerWidth -
+            player.offsetWidth;
+
+        const maxY =
+            window.innerHeight -
+            player.offsetHeight;
+
+        x = Math.max(
+            0,
+            Math.min(x, maxX)
+        );
+
+        y = Math.max(
+            0,
+            Math.min(y, maxY)
+        );
+
+        player.style.left =
+            x + "px";
+
+        player.style.top =
+            y + "px";
+    });
+
+    player.addEventListener("pointerup", function(e) {
+
+        dragging = false;
+
+        try {
+            player.releasePointerCapture(
+                e.pointerId
+            );
+        } catch (_) {}
+    });
+
+    player.addEventListener("pointercancel", function(e) {
+
+        dragging = false;
+
+        try {
+            player.releasePointerCapture(
+                e.pointerId
+            );
+        } catch (_) {}
+    });
+}
+
+
+async function spotifyPlayTrack(
+    track,
+    container,
+    button,
+    sequential = false
+) {
+
+    if (!track) {
+        return;
+    }
+
+    if (!sequential) {
+        spotifyPlayback.active = false;
+        spotifyPlayback.index = -1;
+        spotifyPlayback.tracks = [];
+    }
+
+    stopPreview();
+
+    if (button) {
+
+        button.disabled = true;
+        button.innerText =
+            "⏳ Buscando";
+
+    }
+
+    const artist =
+        track.artist || "";
+
+    const title =
+        track.title || "";
+
+    const query =
+        artist
+            ? artist + " - " + title
+            : title;
+
+    const status =
+        document.getElementById(
+            "spotifyStatus"
+        );
+
+    if (status) {
+
+        status.innerText =
+            sequential
+                ? "🎧 Reproduciendo " +
+                  (spotifyPlayback.index + 1) +
+                  " de " +
+                  spotifyPlayback.tracks.length +
+                  ": " +
+                  artist +
+                  " — " +
+                  title
+                : "🎧 Buscando: " +
+                  artist +
+                  " — " +
+                  title;
+
+    }
+
+    try {
+
+        const searchResponse =
+            await fetch(
+                "/api/search?q=" +
+                encodeURIComponent(query)
+            );
+
+        const searchData =
+            await searchResponse.json();
+
+        if (
+            !searchData.results ||
+            !searchData.results.length
+        ) {
+
+            throw new Error(
+                "No se encontró la canción en YouTube."
+            );
+
+        }
+
+        const result =
+            searchData.results[0];
+
+        const id =
+            result.id;
+
+        if (!id) {
+
+            throw new Error(
+                "YouTube no devolvió un identificador válido."
+            );
+
+        }
+
+        if (
+            sequential &&
+            !spotifyPlayback.active
+        ) {
+            return;
+        }
+
+        const player =
+            document.createElement("div");
+
+        /*
+         * Reproducción individual:
+         * mantiene el reproductor dentro de la canción.
+         *
+         * Reproducción de lista:
+         * usa un reproductor flotante independiente.
+         */
+        player.className =
+            sequential
+                ? "player spotify-floating-player"
+                : "player";
+
+        player.innerHTML = `
+
+            <button
+                class="spotify-floating-close"
+                onclick="spotifyPlayerClose()"
+                title="Cerrar reproductor">
+                ×
+            </button>
+
+            <div class="spotify-floating-info">
+
+                <div class="player-info">
+                    🎧 Preparando previsualización...
+                </div>
+
+                <div class="spotify-floating-position">
+                    ${spotifyPlayback.index + 1} de ${spotifyPlayback.tracks.length}
+                </div>
+
+            </div>
+
+            <div class="spotify-floating-progress">
+
+                <span class="spotify-time-current">
+                    0:00
+                </span>
+
+                <input
+                    class="spotify-progress"
+                    type="range"
+                    min="0"
+                    max="0"
+                    value="0"
+                    step="0.1">
+
+                <span class="spotify-time-duration">
+                    0:00
+                </span>
+
+            </div>
+
+            <div class="spotify-floating-controls">
+
+                <button
+                    class="spotify-floating-control"
+                    onclick="spotifyPlayerPrev()"
+                    title="Anterior">
+                    ⏮
+                </button>
+
+                <button
+                    id="spotify-floating-toggle"
+                    class="spotify-floating-control spotify-floating-main"
+                    onclick="spotifyPlayerToggle()"
+                    title="Play / Pausa">
+                    ▶
+                </button>
+
+                <button
+                    class="spotify-floating-control"
+                    onclick="spotifyPlayerNext()"
+                    title="Siguiente">
+                    ⏭
+                </button>
+
+            </div>
+
+            <audio
+                autoplay
+                preload="auto">
+            </audio>
+
+        `;
+
+        if (sequential) {
+
+            /*
+             * La lista completa usa un reproductor
+             * flotante independiente de las filas.
+             */
+            document.body.appendChild(player);
+
+            enableSpotifyPlayerDrag(player);
+
+        } else if (container) {
+
+            /*
+             * La reproducción individual permanece
+             * exactamente donde estaba.
+             */
+            container.appendChild(player);
+
+        } else {
+
+            const list =
+                document.getElementById(
+                    "spotifyList"
+                );
+
+            if (list) {
+                list.appendChild(player);
+            }
+
+        }
+
+        currentPlayer = id;
+
+        const response =
+            await fetch(
+                "/api/preview?id=" +
+                encodeURIComponent(id)
+            );
+
+        const data =
+            await response.json();
+
+        if (data.error) {
+
+            throw new Error(
+                data.error
+            );
+
+        }
+
+        if (
+            sequential &&
+            !spotifyPlayback.active
+        ) {
+
+            player.remove();
+            return;
+
+        }
+
+        const audio =
+            player.querySelector("audio");
+
+        const progress =
+            player.querySelector(".spotify-progress");
+
+        const currentTimeLabel =
+            player.querySelector(".spotify-time-current");
+
+        const durationLabel =
+            player.querySelector(".spotify-time-duration");
+
+        function formatSpotifyTime(seconds) {
+
+            if (!Number.isFinite(seconds) || seconds < 0) {
+                return "0:00";
+            }
+
+            const minutes =
+                Math.floor(seconds / 60);
+
+            const secs =
+                Math.floor(seconds % 60)
+                    .toString()
+                    .padStart(2, "0");
+
+            return minutes + ":" + secs;
+        }
+
+        function updateSpotifyProgress() {
+
+            if (!audio) {
+                return;
+            }
+
+            const duration =
+                Number.isFinite(audio.duration)
+                    ? audio.duration
+                    : 0;
+
+            if (progress) {
+                progress.max = duration;
+                progress.value =
+                    Math.min(audio.currentTime || 0, duration);
+            }
+
+            if (currentTimeLabel) {
+                currentTimeLabel.innerText =
+                    formatSpotifyTime(audio.currentTime || 0);
+            }
+
+            if (durationLabel) {
+                durationLabel.innerText =
+                    formatSpotifyTime(duration);
+            }
+        }
+
+        audio.addEventListener(
+            "loadedmetadata",
+            function() {
+
+                const duration =
+                    Number.isFinite(audio.duration)
+                        ? Math.min(audio.duration, 30)
+                        : 30;
+
+                if (progress) {
+                    progress.max = duration;
+                }
+
+                if (durationLabel) {
+                    durationLabel.innerText =
+                        formatSpotifyTime(duration);
+                }
+
+                updateSpotifyProgress();
+            }
+        );
+
+        audio.addEventListener(
+            "timeupdate",
+            updateSpotifyProgress
+        );
+
+        if (progress) {
+
+            progress.addEventListener(
+                "input",
+                function() {
+
+                    const value =
+                        Number(progress.value);
+
+                    if (Number.isFinite(value)) {
+                        audio.currentTime = value;
+                    }
+
+                    updateSpotifyProgress();
+                }
+            );
+        }
+
+        audio.addEventListener(
+            "play",
+            function() {
+
+                const toggle =
+                    player.querySelector(
+                        "#spotify-floating-toggle"
+                    );
+
+                if (toggle) {
+                    toggle.innerText = "⏸";
+                    toggle.title = "Pausa";
+                }
+            }
+        );
+
+        audio.addEventListener(
+            "pause",
+            function() {
+
+                const toggle =
+                    player.querySelector(
+                        "#spotify-floating-toggle"
+                    );
+
+                if (toggle) {
+                    toggle.innerText = "▶";
+                    toggle.title = "Play";
+                }
+            }
+        );
+
+        if (sequential) {
+
+            spotifyPlayback.player =
+                player;
+
+            spotifyPlayback.audio =
+                audio;
+        }
+
+        audio.src =
+            data.url;
+
+        const info =
+            player.querySelector(
+                ".player-info"
+            );
+
+        info.innerText =
+            "🎧 " +
+            (artist
+                ? artist + " — " + title
+                : title);
+
+        audio.onended =
+            async function() {
+
+                if (!spotifyPlayback.active) {
+                    return;
+                }
+
+                const nextIndex =
+                    spotifyPlayback.index + 1;
+
+                if (
+                    nextIndex >=
+                    spotifyPlayback.tracks.length
+                ) {
+
+                    spotifyPlayback.active = false;
+                    spotifyPlayback.index = -1;
+
+                    stopPreview();
+
+                    if (status) {
+                        status.innerText =
+                            "✅ Lista terminada.";
+                    }
+
+                    return;
+                }
+
+                await spotifyPlayIndex(
+                    nextIndex
+                );
+
+            };
+
+        audio.play().catch(() => {});
+
+        if (button) {
+
+            button.disabled = false;
+            button.classList.add("active");
+
+            button.innerText =
+                sequential
+                    ? "⏹ Reproduciendo"
+                    : "⏹ Reproduciendo";
+
+        }
+
+    } catch (error) {
+
+        if (sequential) {
+
+            /*
+             * Si una canción falla durante la
+             * reproducción automática,
+             * continuamos con la siguiente.
+             */
+
+            const nextIndex =
+                spotifyPlayback.index + 1;
+
+            if (
+                spotifyPlayback.active &&
+                nextIndex <
+                spotifyPlayback.tracks.length
+            ) {
+
+                await spotifyPlayIndex(
+                    nextIndex
+                );
+
+                return;
+            }
+
+            spotifyPlayback.active = false;
+            spotifyPlayback.index = -1;
+
+        }
+
+        const oldPlayer =
+            container
+                ? container.querySelector(
+                    ".player"
+                )
+                : null;
+
+        if (oldPlayer) {
+            oldPlayer.remove();
+        }
+
+        if (button) {
+
+            button.disabled = false;
+            button.innerText =
+                "▶ Escuchar";
+
+            button.classList.remove(
+                "active"
+            );
+
+        }
+
+        currentPlayer = null;
+
+        if (status) {
+
+            status.innerText =
+                "❌ " +
+                (
+                    error.message ||
+                    "No se pudo preparar la previsualización."
+                );
+
+        }
+
+        if (!sequential) {
+
+            alert(
+                error.message ||
+                "No se pudo preparar la previsualización."
+            );
+
+        }
+
+    }
+}
+
+function spotifySelectAll() {
+
+    const boxes =
+        document.querySelectorAll(
+            ".spotify-check"
+        );
+
+    if (!boxes.length) {
+        return;
+    }
+
+    let allChecked = true;
+
+    boxes.forEach(
+        function(box) {
+
+            if (!box.checked) {
+                allChecked = false;
+            }
+
+        }
+    );
+
+    boxes.forEach(
+        function(box) {
+            box.checked = !allChecked;
+        }
+    );
+}
+
+
+async function spotifyWatchDownload(
+    job,
+    card
+) {
+
+    if (!job || !card) {
+        return;
+    }
+
+    const statusBox =
+        card.querySelector(
+            ".spotify-download-status"
+        );
+
+    if (!statusBox) {
+        return;
+    }
+
+    let finished = false;
+
+    while (!finished) {
+
+        try {
+
+            const response =
+                await fetch(
+                    "/api/queue",
+                    {
+                        cache: "no-store"
+                    }
+                );
+
+            const data =
+                await response.json();
+
+            const queue =
+                data.queue || [];
+
+            const history =
+                data.history || [];
+
+            const active =
+                queue.find(
+                    function(item) {
+                        return item.job === job;
+                    }
+                );
+
+            if (active) {
+
+                const progress =
+                    Number(
+                        active.progress || 0
+                    );
+
+                let message =
+                    active.message ||
+                    "Descargando...";
+
+                if (
+                    active.status === "queued"
+                ) {
+
+                    statusBox.className =
+                        "spotify-download-status spotify-download-status-loading";
+
+                    statusBox.innerHTML =
+                        "⏳ " +
+                        spotifyEscape(
+                            message
+                        );
+
+                } else {
+
+                    statusBox.className =
+                        "spotify-download-status spotify-download-status-progress";
+
+                    statusBox.innerHTML =
+                        "<div>📥 " +
+                        spotifyEscape(
+                            message
+                        ) +
+                        " · " +
+                        progress +
+                        "%</div>" +
+
+                        "<div class=\"spotify-download-progress\">" +
+                            "<div style=\"width:" +
+                            Math.max(
+                                0,
+                                Math.min(
+                                    100,
+                                    progress
+                                )
+                            ) +
+                            "%\"></div>" +
+                        "</div>";
+                }
+
+            } else {
+
+                const completed =
+                    history.find(
+                        function(item) {
+                            return item.job === job;
+                        }
+                    );
+
+                if (completed) {
+
+                    const completedStatus =
+                        String(
+                            completed.status || ""
+                        ).toLowerCase();
+
+                    if (
+                        completedStatus === "error" ||
+                        completedStatus === "failed" ||
+                        completedStatus === "cancelled"
+                    ) {
+
+                        statusBox.className =
+                            "spotify-download-status spotify-download-status-error";
+
+                        statusBox.innerText =
+                            "❌ " +
+                            (
+                                completed.message ||
+                                "Error en la descarga."
+                            );
+
+                    } else {
+
+                        statusBox.className =
+                            "spotify-download-status spotify-download-status-success";
+
+                        statusBox.innerText =
+                            "✅ Enviado a Navidrome";
+                    }
+
+                    finished = true;
+
+                } else {
+
+                    /*
+                     * Puede haber un pequeño intervalo entre
+                     * desaparecer de la cola y aparecer en historial.
+                     */
+                    statusBox.className =
+                        "spotify-download-status spotify-download-status-progress";
+
+                    statusBox.innerText =
+                        "📦 Finalizando...";
+                }
+            }
+
+        } catch (error) {
+
+            console.error(
+                "Error consultando progreso Spotify:",
+                error
+            );
+        }
+
+        if (!finished) {
+
+            await new Promise(
+                function(resolve) {
+                    setTimeout(
+                        resolve,
+                        1000
+                    );
+                }
+            );
+        }
+    }
+}
+
+
+async function spotifyDownloadSelected() {
+
+    if (
+        !spotifyPlaylist ||
+        !spotifyPlaylist.tracks
+    ) {
+        return;
+    }
+
+    const boxes =
+        Array.from(
+            document.querySelectorAll(
+                ".spotify-check:checked"
+            )
+        );
+
+    if (!boxes.length) {
+
+        alert(
+            "Selecciona al menos una canción."
+        );
+
+        return;
+    }
+
+    const status =
+        document.getElementById(
+            "spotifyStatus"
+        );
+
+    status.innerText =
+        "⏳ Añadiendo canciones seleccionadas...";
+
+    let added = 0;
+    let errors = 0;
+
+    /*
+     * Procesamos cada tarjeta por separado.
+     *
+     * Esto utiliza exactamente el mismo mecanismo
+     * que la descarga individual que ya funciona:
+     *
+     * tarjeta -> /api/spotify/download -> job
+     * -> spotifyWatchDownload(job, tarjeta)
+     *
+     * De esta forma cada job queda ligado directamente
+     * a SU tarjeta y nunca dependemos del orden de
+     * data.queued.
+     */
+
+    for (
+        let i = 0;
+        i < boxes.length;
+        i++
+    ) {
+
+        const box =
+            boxes[i];
+
+        const trackIndex =
+            parseInt(
+                box.dataset.index
+            );
+
+        const track =
+            spotifyPlaylist.tracks[
+                trackIndex
+            ];
+
+        const card =
+            box.closest(
+                ".spotify-track"
+            );
+
+        if (!track || !card) {
+            errors++;
+            continue;
+        }
+
+        const statusBox =
+            card.querySelector(
+                ".spotify-download-status"
+            );
+
+        /*
+         * El estado aparece inmediatamente
+         * dentro de ESTA tarjeta.
+         */
+
+        if (statusBox) {
+
+            statusBox.className =
+                "spotify-download-status spotify-download-status-loading";
+
+            statusBox.innerText =
+                "⏳ Buscando...";
+        }
+
+        try {
+
+            const response =
+                await fetch(
+                    "/api/spotify/download",
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type":
+                                "application/json"
+                        },
+                        body: JSON.stringify({
+                            tracks: [track]
+                        })
+                    }
+                );
+
+            const data =
+                await response.json();
+
+            if (!response.ok) {
+
+                throw new Error(
+                    data.error ||
+                    "No se pudo descargar."
+                );
+            }
+
+            if (
+                data.errors &&
+                data.errors.length
+            ) {
+
+                throw new Error(
+                    data.errors[0].error ||
+                    "No se pudo encontrar la canción."
+                );
+            }
+
+            const queuedJob =
+                data.queued &&
+                data.queued.length
+                    ? data.queued[0].job
+                    : null;
+
+            if (!queuedJob) {
+
+                throw new Error(
+                    "No se recibió el trabajo de descarga."
+                );
+            }
+
+            added++;
+
+            /*
+             * AQUÍ está la parte importante:
+             * el job se entrega directamente a la
+             * tarjeta que corresponde a este checkbox.
+             */
+
+            spotifyWatchDownload(
+                queuedJob,
+                card
+            );
+
+        } catch (error) {
+
+            errors++;
+
+            if (statusBox) {
+
+                statusBox.className =
+                    "spotify-download-status spotify-download-status-error";
+
+                statusBox.innerText =
+                    "❌ " +
+                    error.message;
+            }
+
+        }
+
+    }
+
+    let message =
+        "✅ " +
+        added +
+        " canciones añadidas a la cola.";
+
+    if (errors) {
+
+        message +=
+            " " +
+            errors +
+            " no se pudieron añadir.";
+    }
+
+    status.innerText =
+        message;
+
+    if (
+        typeof updateQueue === "function"
+    ) {
+        updateQueue();
+    }
+}
+
+
+
+    try {
+        loadSpotifySavedLists();
+    } catch (error) {
+        console.error(
+            "Error inicializando historial Spotify:",
+            error
+        );
+    }
+
+</script>
+
+
 <!-- FIN ALBUM_SEARCH_SECTION_V2 -->
 
 </body>
@@ -6858,7 +10074,7 @@ def search_youtube(query):
         "--flat-playlist",
         "--dump-single-json",
         "--skip-download",
-        f"ytsearch50:{query}"
+        f"ytsearch100:{query}"
     ]
 
     result = subprocess.run(
@@ -6868,14 +10084,25 @@ def search_youtube(query):
         timeout=90
     )
 
-    if result.returncode != 0:
+    # yt-dlp puede devolver resultados válidos aunque
+    # alguna página posterior falle. En ese caso intentamos
+    # aprovechar el JSON recibido antes de devolver un error.
+    if not result.stdout.strip():
 
         raise RuntimeError(
             result.stderr.strip()
             or "yt-dlp ha fallado"
         )
 
-    data = json.loads(result.stdout)
+    try:
+        data = json.loads(result.stdout)
+
+    except json.JSONDecodeError:
+
+        raise RuntimeError(
+            result.stderr.strip()
+            or "yt-dlp no devolvió un JSON válido"
+        )
 
     entries = data.get("entries", [])
 
@@ -6883,7 +10110,7 @@ def search_youtube(query):
 
     for item in entries:
 
-        if not item:
+        if not isinstance(item, dict):
             continue
 
         video_id = item.get("id")
@@ -6921,6 +10148,15 @@ def search_youtube(query):
                 item.get("duration")
 
         })
+
+    # Solo consideramos error si no hemos obtenido
+    # absolutamente ningún resultado.
+    if not output and result.returncode != 0:
+
+        raise RuntimeError(
+            result.stderr.strip()
+            or "yt-dlp no encontró resultados"
+        )
 
     return output
 
@@ -6971,7 +10207,14 @@ def get_preview_url(video_id):
     return preview_url[0]
 
 
-def do_download(job, video_id, title=""):
+def do_download(
+        job,
+        video_id,
+        title="",
+        album_group=None,
+        album_title=None,
+        album_track_index=0,
+        album_track_total=0):
 
     with download_lock:
 
@@ -6985,7 +10228,12 @@ def do_download(job, video_id, title=""):
                 "message": "Descargando...",
                 "progress": 0,
                 "title": title or video_id,
-                "id": video_id
+                "id": video_id,
+                "type": "navidrome",
+                "album_group": album_group,
+                "album_title": album_title,
+                "album_track_index": album_track_index,
+                "album_track_total": album_track_total
             }
 
             url = (
@@ -6995,6 +10243,9 @@ def do_download(job, video_id, title=""):
             command = [
 
                 "yt-dlp",
+
+                "--js-runtimes",
+                "node",
 
                 "--newline",
 
@@ -7045,6 +10296,7 @@ def do_download(job, video_id, title=""):
             output_lines = []
 
             start_time = time.time()
+            last_state_save = 0
 
             while True:
 
@@ -7087,7 +10339,23 @@ def do_download(job, video_id, title=""):
                 elif process.poll() is not None:
                     break
 
-                if time.time() - start_time > 600:
+                pause_started = None
+
+                with download_control_lock:
+                    pause_started = download_pause_started.get(job)
+
+                paused_elapsed = 0
+
+                if pause_started is not None:
+                    paused_elapsed = time.time() - pause_started
+
+                active_time = (
+                    time.time()
+                    - start_time
+                    - paused_elapsed
+                )
+
+                if active_time > 600:
 
                     process.kill()
 
@@ -7175,7 +10443,12 @@ def do_download(job, video_id, title=""):
                     "Canción subida a la carpeta de Navidrome",
                 "progress": 100,
                 "title": title or video_id,
-                "id": video_id
+                "id": video_id,
+                "type": "navidrome",
+                "album_group": album_group,
+                "album_title": album_title,
+                "album_track_index": album_track_index,
+                "album_track_total": album_track_total
             }
 
             add_history(
@@ -7188,6 +10461,8 @@ def do_download(job, video_id, title=""):
                 job,
                 None
             )
+
+            clear_download_control(job)
 
         except Exception as error:
 
@@ -7196,19 +10471,51 @@ def do_download(job, video_id, title=""):
                 None
             )
 
-            downloads[job] = {
-                "status": "error",
-                "message": str(error),
-                "progress": 0,
-                "title": title or video_id,
-                "id": video_id
-            }
+            control = get_download_control(job)
+
+            if control == "cancelled":
+
+                downloads[job] = {
+                    "status": "cancelled",
+                    "message": "Descarga cancelada.",
+                    "progress": downloads.get(
+                        job,
+                        {}
+                    ).get(
+                        "progress",
+                        0
+                    ),
+                    "title": title or video_id,
+                    "id": video_id,
+                    "type": "navidrome",
+                    "album_group": album_group,
+                    "album_title": album_title,
+                    "album_track_index": album_track_index,
+                    "album_track_total": album_track_total
+                }
+
+            else:
+
+                downloads[job] = {
+                    "status": "error",
+                    "message": str(error),
+                    "progress": 0,
+                    "title": title or video_id,
+                    "id": video_id,
+                    "type": "navidrome",
+                    "album_group": album_group,
+                    "album_title": album_title,
+                    "album_track_index": album_track_index,
+                    "album_track_total": album_track_total
+                }
 
             add_history(
                 job,
                 video_id,
                 title
             )
+
+            clear_download_control(job)
 
 
 
@@ -7961,6 +11268,897 @@ def load_album_by_release_group(
     }
 
 
+
+# ============================================================
+# SPOTIFY PLAYLIST IMPORT
+# CSV / TXT / JSON
+# ============================================================
+
+def _spotify_clean(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _spotify_normalize(value):
+    value = _spotify_clean(value).lower()
+    value = value.replace("_", " ")
+    value = value.replace("-", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _spotify_pick(row, names):
+    normalized = {
+        _spotify_normalize(k): v
+        for k, v in row.items()
+        if k is not None
+    }
+
+    for name in names:
+        value = normalized.get(
+            _spotify_normalize(name),
+            ""
+        )
+
+        if _spotify_clean(value):
+            return _spotify_clean(value)
+
+    return ""
+
+
+def spotify_parse_csv(content):
+    content = content.lstrip("\ufeff")
+
+    try:
+        sample = content[:5000]
+        dialect = csv.Sniffer().sniff(
+            sample,
+            delimiters=",;\t|"
+        )
+    except Exception:
+        dialect = csv.excel
+
+    reader = csv.DictReader(
+        io.StringIO(content),
+        dialect=dialect
+    )
+
+    tracks = []
+
+    for position, row in enumerate(reader, 1):
+
+        title = _spotify_pick(
+            row,
+            [
+                "Track Name",
+                "Track",
+                "Song Name",
+                "Song",
+                "Name",
+                "Title"
+            ]
+        )
+
+        artist = _spotify_pick(
+            row,
+            [
+                "Artist Name(s)",
+                "Artist Names",
+                "Artists",
+                "Artist",
+                "Track Artist",
+                "Artist Name"
+            ]
+        )
+
+        album = _spotify_pick(
+            row,
+            [
+                "Album Name",
+                "Album",
+                "Record"
+            ]
+        )
+
+        uri = _spotify_pick(
+            row,
+            [
+                "Track URI",
+                "Spotify URI",
+                "URI"
+            ]
+        )
+
+        duration = _spotify_pick(
+            row,
+            [
+                "Duration_ms",
+                "Duration",
+                "Track Duration"
+            ]
+        )
+
+        if not title:
+            continue
+
+        tracks.append({
+            "position": position,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "uri": uri,
+            "duration": duration
+        })
+
+    return tracks
+
+
+def spotify_parse_txt(content):
+    content = content.lstrip("\ufeff")
+
+    tracks = []
+
+    for position, raw_line in enumerate(
+        content.splitlines(),
+        1
+    ):
+
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        # Formato:
+        # Artista - Canción
+        # Canción - Artista
+        # Artista -- Canción
+        # Canción -- Artista
+        parts = re.split(
+            r"\s+--\s+|\s+-\s+|\s+\|\s+",
+            line,
+            maxsplit=1
+        )
+
+        if len(parts) == 2:
+
+            first = parts[0].strip()
+            second = parts[1].strip()
+
+            artist = first
+            title = second
+
+        else:
+
+            title = line
+            artist = ""
+
+        # Eliminar numeración inicial
+        title = re.sub(
+            r"^\s*\d+\s*[\.\)\-:]\s*",
+            "",
+            title
+        ).strip()
+
+        if not title:
+            continue
+
+        tracks.append({
+            "position": position,
+            "title": title,
+            "artist": artist,
+            "album": "",
+            "uri": "",
+            "duration": ""
+        })
+
+    return tracks
+
+
+def spotify_json_find_tracks(data):
+
+    found = []
+
+    def walk(obj):
+
+        if isinstance(obj, list):
+
+            for item in obj:
+                walk(item)
+
+            return
+
+        if not isinstance(obj, dict):
+            return
+
+        # Formato Spotify / Exportify:
+        # track.name
+        # track.artists
+        if isinstance(obj.get("track"), dict):
+
+            track = obj["track"]
+
+            if (
+                track.get("name")
+                or
+                track.get("title")
+            ):
+
+                found.append(track)
+
+        # También aceptamos directamente:
+        # {name, artist, album}
+        if (
+            obj.get("name")
+            and
+            (
+                obj.get("artist")
+                or
+                obj.get("artists")
+                or
+                obj.get("album")
+            )
+        ):
+
+            found.append(obj)
+
+        for key, value in obj.items():
+
+            if key in (
+                "items",
+                "tracks",
+                "playlist",
+                "songs",
+                "data"
+            ):
+
+                walk(value)
+
+    walk(data)
+
+    return found
+
+
+def spotify_parse_json(content):
+
+    content = content.lstrip("\ufeff")
+
+    data = json.loads(content)
+
+    raw_tracks = spotify_json_find_tracks(data)
+
+    tracks = []
+
+    for position, item in enumerate(
+        raw_tracks,
+        1
+    ):
+
+        title = _spotify_clean(
+            item.get("name")
+            or
+            item.get("title")
+            or
+            item.get("track_name")
+        )
+
+        artists = item.get("artists", "")
+
+        if isinstance(artists, list):
+
+            names = []
+
+            for artist in artists:
+
+                if isinstance(artist, dict):
+                    name = artist.get("name", "")
+                else:
+                    name = str(artist)
+
+                if name:
+                    names.append(str(name))
+
+            artist = ", ".join(names)
+
+        else:
+
+            artist = _spotify_clean(
+                item.get("artist")
+                or
+                item.get("artist_name")
+                or
+                item.get("artists")
+            )
+
+        album_value = item.get("album", "")
+
+        if isinstance(album_value, dict):
+            album = _spotify_clean(
+                album_value.get("name", "")
+            )
+        else:
+            album = _spotify_clean(
+                album_value
+            )
+
+        uri = _spotify_clean(
+            item.get("uri")
+            or
+            item.get("track_uri")
+            or
+            item.get("spotify_uri")
+        )
+
+        duration = _spotify_clean(
+            item.get("duration_ms")
+            or
+            item.get("duration")
+        )
+
+        if not title:
+            continue
+
+        tracks.append({
+            "position": position,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "uri": uri,
+            "duration": duration
+        })
+
+    return tracks
+
+
+
+# ============================================================
+# Spotify - historial persistente de playlists
+# ============================================================
+
+SPOTIFY_LISTS_FILE = "/opt/music-downloader/data/spotify_playlists.json"
+
+def load_spotify_lists():
+    try:
+        if not os.path.exists(SPOTIFY_LISTS_FILE):
+            return []
+
+        with open(
+            SPOTIFY_LISTS_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            return []
+
+        return data
+
+    except Exception as error:
+        print(
+            "ERROR cargando historial Spotify:",
+            repr(error)
+        )
+        return []
+
+
+def save_spotify_lists(lists):
+    try:
+        os.makedirs(
+            os.path.dirname(SPOTIFY_LISTS_FILE),
+            exist_ok=True
+        )
+
+        tmp = SPOTIFY_LISTS_FILE + ".tmp"
+
+        with open(
+            tmp,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(
+                lists,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(
+            tmp,
+            SPOTIFY_LISTS_FILE
+        )
+
+        return True
+
+    except Exception as error:
+        print(
+            "ERROR guardando historial Spotify:",
+            repr(error)
+        )
+        return False
+
+
+def save_spotify_playlist(result):
+    if not isinstance(result, dict):
+        return
+
+    tracks = result.get("tracks", [])
+
+    if not isinstance(tracks, list):
+        tracks = []
+
+    name = str(
+        result.get("name") or "Playlist"
+    ).strip()
+
+    from datetime import datetime
+
+    playlist = {
+        "id": os.urandom(8).hex(),
+        "name": name,
+        "created_at": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        "count": len(tracks),
+        "tracks": tracks
+    }
+
+    lists = load_spotify_lists()
+
+    # Si ya existe una playlist con el mismo nombre,
+    # sustituimos su contenido por la versión nueva.
+    replaced = False
+
+    for index, old in enumerate(lists):
+        if str(
+            old.get("name", "")
+        ).strip().lower() == name.lower():
+
+            playlist["id"] = old.get(
+                "id",
+                playlist["id"]
+            )
+
+            lists[index] = playlist
+            replaced = True
+            break
+
+    if not replaced:
+        lists.insert(0, playlist)
+
+    # Las más recientes primero.
+    lists = lists[:100]
+
+    save_spotify_lists(lists)
+
+    return playlist
+
+
+def spotify_parse_playlist(filename, content):
+
+    name = Path(
+        filename or "playlist"
+    ).stem
+
+    extension = Path(
+        filename or ""
+    ).suffix.lower()
+
+    if extension == ".csv":
+        tracks = spotify_parse_csv(content)
+
+    elif extension == ".json":
+        tracks = spotify_parse_json(content)
+
+    elif extension == ".txt":
+        tracks = spotify_parse_txt(content)
+
+    else:
+
+        raise ValueError(
+            "Formato no compatible. "
+            "Usa CSV, TXT o JSON."
+        )
+
+    if not tracks:
+
+        raise ValueError(
+            "No se encontraron canciones "
+            "en el archivo."
+        )
+
+    return {
+        "name": name,
+        "count": len(tracks),
+        "tracks": tracks
+    }
+
+
+def spotify_search_and_queue(tracks):
+
+    queued = []
+    errors = []
+
+    for index, track in enumerate(tracks, 1):
+
+        title = _spotify_clean(
+            track.get("title")
+        )
+
+        artist = _spotify_clean(
+            track.get("artist")
+        )
+
+        if not title:
+            errors.append({
+                "position": index,
+                "title": "",
+                "error": "Canción sin título"
+            })
+            continue
+
+        if artist:
+            query = f"{artist} - {title}"
+        else:
+            query = title
+
+        try:
+
+            results = search_youtube(query)
+
+            if not results:
+
+                raise RuntimeError(
+                    "No se encontró en YouTube"
+                )
+
+            result = results[0]
+
+            video_id = result.get("id")
+
+            if not video_id:
+
+                raise RuntimeError(
+                    "YouTube no devolvió un ID"
+                )
+
+            job = os.urandom(8).hex()
+
+            display_title = (
+                f"{artist} - {title}"
+                if artist
+                else title
+            )
+
+            downloads[job] = {
+                "status": "queued",
+                "message": "En cola...",
+                "progress": 0,
+                "title": display_title,
+                "id": video_id,
+                "type": "navidrome"
+            }
+
+            download_queue.put(
+                (
+                    job,
+                    video_id,
+                    display_title
+                )
+            )
+
+            queued.append({
+                "job": job,
+                "position": index,
+                "title": display_title,
+                "id": video_id
+            })
+
+        except Exception as error:
+
+            print(
+                "ERROR Spotify:",
+                repr(error)
+            )
+
+            errors.append({
+                "position": index,
+                "title": (
+                    f"{artist} - {title}"
+                    if artist
+                    else title
+                ),
+                "error": str(error)
+            })
+
+    return {
+        "queued": queued,
+        "errors": errors,
+        "count": len(queued)
+    }
+
+
+
+def do_download_mobile(
+        job,
+        video_id,
+        title="",
+        album_group=None,
+        album_title=None,
+        album_track_index=0,
+        album_track_total=0):
+
+    with download_lock:
+
+        process = None
+
+        job_dir = MOBILE_DOWNLOAD_DIR / job
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+
+            downloads[job] = {
+                "status": "running",
+                "message": "Descargando para móvil...",
+                "progress": 0,
+                "title": title or video_id,
+                "id": video_id,
+                "type": "mobile",
+                "album_group": album_group,
+                "album_title": album_title,
+                "album_track_index": album_track_index,
+                "album_track_total": album_track_total
+            }
+
+            save_mobile_downloads_state()
+
+            url = (
+                f"https://www.youtube.com/watch?v={video_id}"
+            )
+
+            command = [
+
+                "yt-dlp",
+
+                "--js-runtimes",
+                "node",
+
+                "--newline",
+
+                "--progress-template",
+                "%(progress._percent_str)s",
+
+                "--no-overwrites",
+
+                "--continue",
+
+                "-x",
+
+                "--audio-format",
+                "mp3",
+
+                "--audio-quality",
+                "0",
+
+                "--embed-thumbnail",
+
+                "--add-metadata",
+
+                "--parse-metadata",
+                "%(channel)s:%(artist)s",
+
+                "-o",
+
+                str(
+                    job_dir /
+                    "%(title)s.%(ext)s"
+                ),
+
+                url
+            ]
+
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+
+            active_processes[job] = process
+
+            output_lines = []
+
+            start_time = time.time()
+
+            while True:
+
+                line = process.stdout.readline()
+
+                if line:
+
+                    output_lines.append(line)
+
+                    if len(output_lines) > 100:
+                        output_lines.pop(0)
+
+                    match = re.search(
+                        r"(\d+(?:\.\d+)?)%",
+                        line
+                    )
+
+                    if match:
+
+                        try:
+
+                            percent = float(
+                                match.group(1)
+                            )
+
+                            downloads[job]["progress"] = min(
+                                100,
+                                max(0, round(percent))
+                            )
+
+                            downloads[job]["message"] = (
+                                "Descargando para móvil... "
+                                + str(
+                                    downloads[job]["progress"]
+                                )
+                                + "%"
+                            )
+
+                            now = time.time()
+
+                            if now - last_state_save >= 5:
+                                save_mobile_downloads_state()
+                                last_state_save = now
+
+                        except Exception:
+                            pass
+
+                elif process.poll() is not None:
+
+                    break
+
+                pause_started = None
+
+                with download_control_lock:
+                    pause_started = download_pause_started.get(job)
+
+                paused_elapsed = 0
+
+                if pause_started is not None:
+                    paused_elapsed = time.time() - pause_started
+
+                active_time = (
+                    time.time()
+                    - start_time
+                    - paused_elapsed
+                )
+
+                if active_time > 600:
+
+                    process.kill()
+
+                    raise RuntimeError(
+                        "Tiempo de descarga móvil agotado."
+                    )
+
+            returncode = process.wait()
+
+            if returncode != 0:
+
+                raise RuntimeError(
+                    "".join(output_lines)[-2000:]
+                    or
+                    "Error durante la descarga móvil"
+                )
+
+            mp3_files = sorted(
+                job_dir.glob("*.mp3"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+
+            if not mp3_files:
+
+                raise RuntimeError(
+                    "No se encontró el MP3 móvil descargado."
+                )
+
+            mp3 = mp3_files[0]
+
+            downloads[job] = {
+                "status": "done",
+                "message": "Canción preparada para el móvil",
+                "progress": 100,
+                "title": title or video_id,
+                "id": video_id,
+                "type": "mobile",
+                "album_group": album_group,
+                "album_title": album_title,
+                "album_track_index": album_track_index,
+                "album_track_total": album_track_total,
+                "file": str(mp3),
+                "filename": mp3.name,
+                "size": mp3.stat().st_size
+            }
+
+            save_mobile_downloads_state()
+
+            add_history(
+                job,
+                video_id,
+                title
+            )
+
+            active_processes.pop(
+                job,
+                None
+            )
+
+            clear_download_control(job)
+
+        except Exception as error:
+
+            active_processes.pop(
+                job,
+                None
+            )
+
+            control = get_download_control(job)
+
+            if control == "cancelled":
+
+                downloads[job] = {
+                    "status": "cancelled",
+                    "message": "Descarga cancelada.",
+                    "progress": downloads.get(
+                        job,
+                        {}
+                    ).get(
+                        "progress",
+                        0
+                    ),
+                    "title": title or video_id,
+                    "id": video_id,
+                    "type": "mobile",
+                    "album_group": album_group,
+                    "album_title": album_title,
+                    "album_track_index": album_track_index,
+                    "album_track_total": album_track_total
+                }
+
+            else:
+
+                downloads[job] = {
+                    "status": "error",
+                    "message": str(error),
+                    "progress": 0,
+                    "title": title or video_id,
+                    "id": video_id,
+                    "type": "mobile",
+                    "album_group": album_group,
+                    "album_title": album_title,
+                    "album_track_index": album_track_index,
+                    "album_track_total": album_track_total
+                }
+
+            save_mobile_downloads_state()
+
+            add_history(
+                job,
+                video_id,
+                title
+            )
+
+            clear_download_control(job)
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, data, status=200):
@@ -8323,28 +12521,145 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
+        if parsed.path == "/api/spotify/lists":
+
+            self.send_json({
+                "lists": load_spotify_lists()
+            })
+
+            return
+
+
         if parsed.path == "/api/queue":
 
             queued = []
 
+            active_states = (
+                "queued",
+                "running",
+                "paused",
+                "downloading",
+                "processing"
+            )
+
             for job, item in downloads.items():
 
-                if item.get("status") in (
-                    "queued",
-                    "running"
-                ):
+                if item.get("status") in active_states:
 
-                    queued.append({
+                    entry = {
                         "job": job,
                         **item
-                    })
+                    }
+
+                    if not entry.get("type"):
+                        entry["type"] = "navidrome"
+
+                    queued.append(entry)
+
+            history_response = []
+
+            for item in history[-50:]:
+
+                entry = dict(item)
+
+                if not entry.get("type"):
+                    entry["type"] = "navidrome"
+
+                history_response.append(entry)
 
             self.send_json({
                 "queue": queued,
-                "history": history[-50:]
+                "history": history_response
             })
 
             return
+
+
+        if parsed.path == "/api/pause":
+
+            params = urllib.parse.parse_qs(
+                parsed.query
+            )
+
+            job = params.get(
+                "id",
+                [""]
+            )[0].strip()
+
+            if not job or job not in downloads:
+
+                self.send_json(
+                    {
+                        "error": "Trabajo no encontrado."
+                    },
+                    404
+                )
+
+                return
+
+            ok, message = pause_download(job)
+
+            self.send_json(
+                {
+                    "ok": ok,
+                    "job": job,
+                    "message": message,
+                    "status": downloads.get(
+                        job,
+                        {}
+                    ).get(
+                        "status",
+                        ""
+                    )
+                },
+                200 if ok else 400
+            )
+
+            return
+
+
+        if parsed.path == "/api/resume":
+
+            params = urllib.parse.parse_qs(
+                parsed.query
+            )
+
+            job = params.get(
+                "id",
+                [""]
+            )[0].strip()
+
+            if not job or job not in downloads:
+
+                self.send_json(
+                    {
+                        "error": "Trabajo no encontrado."
+                    },
+                    404
+                )
+
+                return
+
+            ok, message = resume_download(job)
+
+            self.send_json(
+                {
+                    "ok": ok,
+                    "job": job,
+                    "message": message,
+                    "status": downloads.get(
+                        job,
+                        {}
+                    ).get(
+                        "status",
+                        ""
+                    )
+                },
+                200 if ok else 400
+            )
+
+            return
+
 
         if parsed.path == "/api/cancel":
 
@@ -8357,62 +12672,210 @@ class Handler(BaseHTTPRequestHandler):
                 [""]
             )[0].strip()
 
-            process = active_processes.get(job)
+            if not job or job not in downloads:
 
-            if not process:
+                self.send_json(
+                    {
+                        "error": "Trabajo no encontrado."
+                    },
+                    404
+                )
+
+                return
+
+            ok, message = cancel_download(job)
+
+            self.send_json(
+                {
+                    "ok": ok,
+                    "job": job,
+                    "message": message,
+                    "status": downloads.get(
+                        job,
+                        {}
+                    ).get(
+                        "status",
+                        ""
+                    )
+                },
+                200 if ok else 400
+            )
+
+            return
+
+
+        if parsed.path == "/api/downloads/delete":
+            params = urllib.parse.parse_qs(parsed.query)
+            job = params.get("id", [""])[0].strip()
+
+            if not job:
+                self.send_json(
+                    {"ok": False, "error": "Trabajo no especificado."},
+                    400
+                )
+                return
+
+            original_count = len(history)
+
+            history[:] = [
+                item
+                for item in history
+                if item.get("job") != job
+            ]
+
+            if len(history) == original_count:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "job": job,
+                        "message": "Registro no encontrado."
+                    },
+                    404
+                )
+                return
+
+            save_history()
+
+            self.send_json(
+                {
+                    "ok": True,
+                    "job": job,
+                    "message": "Registro eliminado."
+                }
+            )
+            return
+
+
+        if parsed.path == "/api/download-mobile-file":
+
+            params = urllib.parse.parse_qs(
+                parsed.query
+            )
+
+            job = params.get(
+                "id",
+                [""]
+            )[0]
+
+            info = downloads.get(job)
+
+            if not info:
 
                 self.send_json({
-                    "error": "La descarga no está activa."
+                    "error": "Trabajo no encontrado."
+                }, 404)
+
+                return
+
+            if info.get("type") != "mobile":
+
+                self.send_json({
+                    "error": "El trabajo no es una descarga móvil."
                 }, 400)
+
+                return
+
+            if info.get("status") != "done":
+
+                self.send_json({
+                    "error": "La descarga todavía no está terminada."
+                }, 409)
+
+                return
+
+            file_value = info.get("file")
+
+            if not file_value:
+
+                self.send_json({
+                    "error": "El archivo móvil no está disponible."
+                }, 404)
 
                 return
 
             try:
 
-                process.kill()
+                mobile_root = MOBILE_DOWNLOAD_DIR.resolve()
+                file_path = Path(file_value).resolve()
 
-                downloads[job] = {
-                    "status": "cancelled",
-                    "message": "Descarga cancelada",
-                    "progress": downloads.get(
-                        job,
-                        {}
-                    ).get(
-                        "progress",
-                        0
-                    ),
-                    "title": downloads.get(
-                        job,
-                        {}
-                    ).get(
-                        "title",
-                        job
-                    ),
-                    "id": downloads.get(
-                        job,
-                        {}
-                    ).get(
-                        "id",
-                        ""
+                if (
+                    mobile_root not in file_path.parents
+                    or not file_path.is_file()
+                ):
+
+                    raise RuntimeError(
+                        "Archivo móvil no válido."
                     )
-                }
 
-                add_history(
-                    job,
-                    downloads[job]["id"],
-                    downloads[job]["title"]
+                size = file_path.stat().st_size
+
+                self.send_response(200)
+
+                self.send_header(
+                    "Content-Type",
+                    "audio/mpeg"
                 )
 
-                self.send_json({
-                    "ok": True,
-                    "message": "Descarga cancelada"
-                })
+                self.send_header(
+                    "Content-Length",
+                    str(size)
+                )
+
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="download.mp3"'
+                )
+
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
+
+                self.end_headers()
+
+                with file_path.open("rb") as source:
+
+                    while True:
+
+                        chunk = source.read(1024 * 1024)
+
+                        if not chunk:
+                            break
+
+                        self.wfile.write(chunk)
+
+                return
+
+            except BrokenPipeError:
+
+                return
 
             except Exception as error:
 
-                self.send_json({
-                    "error": str(error)
-                }, 500)
+                print(
+                    "ERROR /api/download-mobile-file:",
+                    repr(error)
+                )
+
+                return
+
+
+        if parsed.path == "/api/downloads":
+
+            mobile_downloads = []
+
+            for job, item in downloads.items():
+
+                if item.get("type") == "mobile":
+
+                    mobile_downloads.append({
+                        "job": job,
+                        **item
+                    })
+
+            self.send_json({
+                "downloads": mobile_downloads
+            })
 
             return
 
@@ -8461,6 +12924,397 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
+
+
+        if parsed.path == "/api/downloads/reset":
+
+            active_jobs = []
+
+            active_states = (
+                "queued",
+                "running",
+                "paused",
+                "downloading",
+                "processing"
+            )
+
+            for job, item in downloads.items():
+
+                if item.get("status") in active_states:
+                    active_jobs.append(job)
+
+            if active_jobs:
+
+                self.send_json({
+                    "ok": False,
+                    "error":
+                        "No se puede resetear el gestor mientras "
+                        "hay descargas activas.",
+                    "active": active_jobs
+                }, 409)
+
+                return
+
+
+            history_count = len(history)
+
+            history.clear()
+
+            save_history()
+
+
+            mobile_jobs = []
+
+            for job, item in list(downloads.items()):
+
+                if item.get("type") == "mobile":
+                    mobile_jobs.append(job)
+
+            for job in mobile_jobs:
+                downloads.pop(job, None)
+
+            save_mobile_downloads_state()
+
+
+            self.send_json({
+                "ok": True,
+                "message":
+                    "Gestor de descargas reseteado.",
+                "history_reset": history_count,
+                "mobile_reset": len(mobile_jobs)
+            })
+
+            return
+
+
+        if parsed.path == "/api/spotify/list/load":
+
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            body = self.rfile.read(length)
+
+            try:
+
+                data = json.loads(body)
+
+                playlist_id = str(
+                    data.get("id", "")
+                )
+
+                lists = load_spotify_lists()
+
+                selected = None
+
+                for playlist in lists:
+                    if str(
+                        playlist.get("id", "")
+                    ) == playlist_id:
+                        selected = playlist
+                        break
+
+                if selected is None:
+                    raise ValueError(
+                        "Playlist no encontrada."
+                    )
+
+                self.send_json({
+                    "ok": True,
+                    "playlist": selected
+                })
+
+            except Exception as error:
+
+                print(
+                    "ERROR /api/spotify/list/load:",
+                    repr(error)
+                )
+
+                self.send_json({
+                    "error": str(error)
+                }, 400)
+
+            return
+
+
+        if parsed.path == "/api/spotify/list/delete":
+
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            body = self.rfile.read(length)
+
+            try:
+
+                data = json.loads(body)
+
+                playlist_id = str(
+                    data.get("id", "")
+                )
+
+                lists = load_spotify_lists()
+
+                new_lists = [
+                    playlist
+                    for playlist in lists
+                    if str(
+                        playlist.get("id", "")
+                    ) != playlist_id
+                ]
+
+                if len(new_lists) == len(lists):
+                    raise ValueError(
+                        "Playlist no encontrada."
+                    )
+
+                save_spotify_lists(new_lists)
+
+                self.send_json({
+                    "ok": True
+                })
+
+            except Exception as error:
+
+                print(
+                    "ERROR /api/spotify/list/delete:",
+                    repr(error)
+                )
+
+                self.send_json({
+                    "error": str(error)
+                }, 400)
+
+            return
+
+
+        if parsed.path == "/api/spotify/import":
+
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            body = self.rfile.read(length)
+
+            try:
+
+                data = json.loads(body)
+
+                filename = data.get(
+                    "filename",
+                    "playlist.txt"
+                )
+
+                content = data.get(
+                    "content",
+                    ""
+                )
+
+                if not content:
+                    raise ValueError(
+                        "El archivo está vacío."
+                    )
+
+                result = spotify_parse_playlist(
+                    filename,
+                    content
+                )
+
+                saved_playlist = save_spotify_playlist(
+                    result
+                )
+
+                if saved_playlist:
+                    result["saved_id"] = saved_playlist.get(
+                        "id"
+                    )
+
+                self.send_json(
+                    result
+                )
+
+            except Exception as error:
+
+                print(
+                    "ERROR /api/spotify/import:",
+                    repr(error)
+                )
+
+                self.send_json(
+                    {
+                        "error": str(error)
+                    },
+                    400
+                )
+
+            return
+
+
+        if parsed.path == "/api/spotify/download":
+
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            body = self.rfile.read(length)
+
+            try:
+
+                data = json.loads(body)
+
+                tracks = data.get(
+                    "tracks",
+                    []
+                )
+
+                if not isinstance(
+                    tracks,
+                    list
+                ) or not tracks:
+
+                    raise ValueError(
+                        "No hay canciones seleccionadas."
+                    )
+
+                # Limitamos la petición para evitar
+                # una carga accidental enorme.
+                if len(tracks) > 500:
+
+                    raise ValueError(
+                        "La playlist supera el límite de 500 canciones por tanda."
+                    )
+
+                result = spotify_search_and_queue(
+                    tracks
+                )
+
+                self.send_json(
+                    result
+                )
+
+            except Exception as error:
+
+                print(
+                    "ERROR /api/spotify/download:",
+                    repr(error)
+                )
+
+                self.send_json(
+                    {
+                        "error": str(error)
+                    },
+                    400
+                )
+
+            return
+
+
+        if parsed.path == "/api/download-mobile":
+
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            body = self.rfile.read(length)
+
+            try:
+
+                data = json.loads(body)
+
+                video_id = data.get("id")
+
+                if not video_id:
+
+                    raise ValueError(
+                        "Falta el ID del vídeo."
+                    )
+
+                job = os.urandom(8).hex()
+
+                title = data.get(
+                    "title",
+                    video_id
+                )
+
+                album_group = data.get(
+                    "album_group"
+                )
+
+                album_title = data.get(
+                    "album_title"
+                )
+
+                album_track_index = data.get(
+                    "album_track_index",
+                    0
+                )
+
+                album_track_total = data.get(
+                    "album_track_total",
+                    0
+                )
+
+                downloads[job] = {
+                    "status": "queued",
+                    "message": "En cola para móvil...",
+                    "progress": 0,
+                    "title": title,
+                    "id": video_id,
+                    "type": "mobile",
+                    "album_group": album_group,
+                    "album_title": album_title,
+                    "album_track_index": album_track_index,
+                    "album_track_total": album_track_total
+                }
+
+                save_mobile_downloads_state()
+
+                download_queue.put(
+                    (
+                        job,
+                        video_id,
+                        title,
+                        "mobile",
+                        album_group,
+                        album_title,
+                        album_track_index,
+                        album_track_total
+                    )
+                )
+
+                self.send_json({
+                    "job": job,
+                    "type": "mobile"
+                })
+
+            except Exception as error:
+
+                self.send_json(
+                    {
+                        "error": str(error)
+                    },
+                    400
+                )
+
+            return
+
+
         if parsed.path != "/api/download":
 
             self.send_error(404)
@@ -8495,19 +13349,46 @@ class Handler(BaseHTTPRequestHandler):
                 video_id
             )
 
+            album_group = data.get(
+                "album_group"
+            )
+
+            album_title = data.get(
+                "album_title"
+            )
+
+            album_track_index = data.get(
+                "album_track_index",
+                0
+            )
+
+            album_track_total = data.get(
+                "album_track_total",
+                0
+            )
+
             downloads[job] = {
                 "status": "queued",
                 "message": "En cola...",
                 "progress": 0,
                 "title": title,
-                "id": video_id
+                "id": video_id,
+                "type": "navidrome",
+                "album_group": album_group,
+                "album_title": album_title,
+                "album_track_index": album_track_index,
+                "album_track_total": album_track_total
             }
 
             download_queue.put(
                 (
                     job,
                     video_id,
-                    title
+                    title,
+                    album_group,
+                    album_title,
+                    album_track_index,
+                    album_track_total
                 )
             )
 

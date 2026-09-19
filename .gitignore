@@ -1,8 +1,11 @@
 # Descargas de música
 downloads/
+mobile-downloads/
 
-# Historial local
+# Historial y datos locales
 download-history.json
+mobile-downloads.json
+data/
 
 # Archivos temporales / listas locales
 urls.txt
@@ -12,6 +15,10 @@ urls.txt
 *.bak*
 *.backup
 *.backup*
+*.BACK
+*.BACK*
+*.BAK
+*.BAK*
 
 # Python
 __pycache__/
