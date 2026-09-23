@@ -10168,16 +10168,16 @@ def get_preview_url(video_id):
     )
 
     command = [
-
         "yt-dlp",
-
+        "--force-ipv4",
+        "--remote-components",
+        "ejs:github",
+        "--js-runtimes",
+        "deno:/home/franrpi/.deno/bin/deno",
         "--no-playlist",
-
         "-f",
         "bestaudio[ext=m4a]/bestaudio",
-
         "-g",
-
         url
     ]
 
