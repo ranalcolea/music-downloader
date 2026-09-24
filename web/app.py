@@ -11374,8 +11374,11 @@ def spotify_parse_csv(content):
             row,
             [
                 "Duration_ms",
+                "Duration (ms)",
+                "Duration ms",
                 "Duration",
-                "Track Duration"
+                "Track Duration",
+                "Track Duration (ms)"
             ]
         )
 
