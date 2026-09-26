@@ -1,37 +1,5 @@
-# Descargas de música
-downloads/
-mobile-downloads/
-
-# Historial y datos locales
-download-history.json
-mobile-downloads.json
-data/
-
-# Archivos temporales / listas locales
-urls.txt
-
-# Copias de seguridad
-*.bak
-*.bak*
-*.backup
-*.backup*
-*.BACK
-*.BACK*
-*.BAK
-*.BAK*
-
-# Python
 __pycache__/
-*.pyc
-*.pyo
-
-# Entornos virtuales
-venv/
+*.py[cod]
 .venv/
-
-# Logs
-*.log
-
-# Variables y credenciales
+venv/
 .env
-.env.*
