@@ -566,6 +566,12 @@ def queue_worker():
                     else 0
                 )
 
+                format_name = (
+                    item[8]
+                    if len(item) > 8
+                    else "mp3"
+                )
+
                 if get_download_control(job) == "paused":
 
                     downloads[job]["status"] = "paused"
@@ -588,7 +594,8 @@ def queue_worker():
                     album_group,
                     album_title,
                     album_track_index,
-                    album_track_total
+                    album_track_total,
+                    format_name
                 )
 
             else:
@@ -10216,6 +10223,9 @@ def do_download(
         album_track_index=0,
         album_track_total=0):
 
+    # Navidrome usa siempre MP3.
+    format_name = "mp3"
+
     with download_lock:
 
         process = None
@@ -10233,7 +10243,8 @@ def do_download(
                 "album_group": album_group,
                 "album_title": album_title,
                 "album_track_index": album_track_index,
-                "album_track_total": album_track_total
+                "album_track_total": album_track_total,
+                "format": format_name
             }
 
             url = (
@@ -11892,11 +11903,19 @@ def do_download_mobile(
         album_group=None,
         album_title=None,
         album_track_index=0,
-        album_track_total=0):
+        album_track_total=0,
+        format_name="mp3"):
 
     with download_lock:
 
         process = None
+
+        format_name = str(
+            format_name or "mp3"
+        ).lower().strip()
+
+        if format_name not in ("mp3", "opus"):
+            format_name = "mp3"
 
         job_dir = MOBILE_DOWNLOAD_DIR / job
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -11922,46 +11941,106 @@ def do_download_mobile(
                 f"https://www.youtube.com/watch?v={video_id}"
             )
 
-            command = [
+            if format_name == "opus":
 
-                "yt-dlp",
+                command = [
 
-                "--js-runtimes",
-                "node",
+                    "yt-dlp",
 
-                "--newline",
+                    "--js-runtimes",
+                    "node",
 
-                "--progress-template",
-                "%(progress._percent_str)s",
+                    "--newline",
 
-                "--no-overwrites",
+                    "--progress-template",
+                    "%(progress._percent_str)s",
 
-                "--continue",
+                    "--no-overwrites",
 
-                "-x",
+                    "--continue",
 
-                "--audio-format",
-                "mp3",
+                    "-f",
+                    "bestaudio[acodec^=opus]",
 
-                "--audio-quality",
-                "0",
+                    "-x",
 
-                "--embed-thumbnail",
+                    "--audio-format",
+                    "opus",
 
-                "--add-metadata",
+                    "--audio-quality",
+                    "0",
 
-                "--parse-metadata",
-                "%(channel)s:%(artist)s",
+                    "--embed-thumbnail",
 
-                "-o",
+                    "--add-metadata",
 
-                str(
+                    "--parse-metadata",
+                    "%(channel)s:%(artist)s",
+
+                    "-o",
+
+                    str(
+                        job_dir /
+                        "%(title)s.%(ext)s"
+                    ),
+
+                    url
+                ]
+
+            else:
+
+                ffmpeg_progress_file = (
                     job_dir /
-                    "%(title)s.%(ext)s"
-                ),
+                    "ffmpeg-progress.log"
+                )
 
-                url
-            ]
+                command = [
+
+                    "yt-dlp",
+
+                    "--js-runtimes",
+                    "node",
+
+                    "--newline",
+
+                    "--progress-template",
+                    "%(progress._percent_str)s",
+
+                    "--no-overwrites",
+
+                    "--continue",
+
+                    "-x",
+
+                    "--audio-format",
+                    "mp3",
+
+                    "--audio-quality",
+                    "0",
+
+                    "--postprocessor-args",
+                    (
+                        "ExtractAudio:"
+                        "-progress "
+                        + str(ffmpeg_progress_file)
+                    ),
+
+                    "--embed-thumbnail",
+
+                    "--add-metadata",
+
+                    "--parse-metadata",
+                    "%(channel)s:%(artist)s",
+
+                    "-o",
+
+                    str(
+                        job_dir /
+                        "%(title)s.%(ext)s"
+                    ),
+
+                    url
+                ]
 
             process = subprocess.Popen(
                 command,
@@ -11977,6 +12056,196 @@ def do_download_mobile(
 
             start_time = time.time()
 
+            # -------------------------------------------------
+            # Monitor independiente del progreso real de FFmpeg.
+            # Solo se utiliza durante la conversión MP3.
+            # -------------------------------------------------
+
+            ffmpeg_progress_stop = threading.Event()
+
+            def monitor_mp3_conversion():
+
+                if format_name != "mp3":
+                    return
+
+                progress_file = Path(
+                    ffmpeg_progress_file
+                )
+
+                duration = 0.0
+                last_progress = -1
+                last_save = 0.0
+
+                while not ffmpeg_progress_stop.is_set():
+
+                    try:
+
+                        # Buscar la fuente WebM descargada.
+                        if duration <= 0:
+
+                            webm_files = list(
+                                job_dir.glob("*.webm")
+                            )
+
+                            if webm_files:
+
+                                try:
+
+                                    probe = subprocess.run(
+                                        [
+                                            "ffprobe",
+                                            "-v",
+                                            "error",
+                                            "-show_entries",
+                                            "format=duration",
+                                            "-of",
+                                            "default=noprint_wrappers=1:nokey=1",
+                                            str(webm_files[0])
+                                        ],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=10
+                                    )
+
+                                    value = (
+                                        probe.stdout or ""
+                                    ).strip()
+
+                                    if value:
+                                        duration = float(value)
+
+                                except Exception:
+                                    pass
+
+                        if progress_file.exists():
+
+                            values = {}
+
+                            text = progress_file.read_text(
+                                encoding="utf-8",
+                                errors="ignore"
+                            )
+
+                            for raw_line in text.splitlines():
+
+                                if "=" not in raw_line:
+                                    continue
+
+                                key, value = raw_line.split(
+                                    "=",
+                                    1
+                                )
+
+                                values[key.strip()] = (
+                                    value.strip()
+                                )
+
+                            seconds = 0.0
+
+                            out_time_ms = values.get(
+                                "out_time_ms"
+                            )
+
+                            out_time = values.get(
+                                "out_time"
+                            )
+
+                            if out_time_ms:
+
+                                try:
+
+                                    seconds = (
+                                        float(out_time_ms)
+                                        / 1000000.0
+                                    )
+
+                                except Exception:
+                                    seconds = 0.0
+
+                            if seconds <= 0 and out_time:
+
+                                try:
+
+                                    parts = out_time.split(":")
+
+                                    if len(parts) == 3:
+
+                                        seconds = (
+                                            float(parts[0])
+                                            * 3600
+                                            +
+                                            float(parts[1])
+                                            * 60
+                                            +
+                                            float(parts[2])
+                                        )
+
+                                except Exception:
+                                    seconds = 0.0
+
+                            if (
+                                duration > 0
+                                and seconds >= 0
+                            ):
+
+                                percent = round(
+                                    min(
+                                        99,
+                                        max(
+                                            0,
+                                            (
+                                                seconds
+                                                / duration
+                                            ) * 100
+                                        )
+                                    )
+                                )
+
+                                if percent != last_progress:
+
+                                    downloads[job][
+                                        "status"
+                                    ] = "processing"
+
+                                    downloads[job][
+                                        "progress"
+                                    ] = percent
+
+                                    downloads[job][
+                                        "message"
+                                    ] = (
+                                        "⚙️ "
+                                        "Convirtiendo "
+                                        "audio a MP3... "
+                                        + str(percent)
+                                        + "%"
+                                    )
+
+                                    last_progress = percent
+
+                                    now = time.time()
+
+                                    if (
+                                        now - last_save
+                                        >= 2
+                                    ):
+
+                                        save_mobile_downloads_state()
+                                        last_save = now
+
+                    except Exception:
+                        pass
+
+                    ffmpeg_progress_stop.wait(0.5)
+
+            mp3_progress_thread = threading.Thread(
+                target=monitor_mp3_conversion,
+                daemon=True
+            )
+
+            if format_name == "mp3":
+                mp3_progress_thread.start()
+
             while True:
 
                 line = process.stdout.readline()
@@ -11988,40 +12257,105 @@ def do_download_mobile(
                     if len(output_lines) > 100:
                         output_lines.pop(0)
 
-                    match = re.search(
-                        r"(\d+(?:\.\d+)?)%",
-                        line
-                    )
+                    # -------------------------------------------------
+                    # Progreso real del trabajo móvil.
+                    #
+                    # El porcentaje de yt-dlp llega al 100% cuando termina
+                    # la descarga, pero todavía puede quedar bastante
+                    # procesamiento de ffmpeg/yt-dlp:
+                    #
+                    #   ExtractAudio
+                    #   Metadata
+                    #   ThumbnailsConvertor
+                    #   EmbedThumbnail
+                    #
+                    # No dejamos que la APK parezca bloqueada al 100%.
+                    # -------------------------------------------------
 
-                    if match:
+                    processing_message = None
 
-                        try:
+                    if "[ExtractAudio]" in line:
 
-                            percent = float(
-                                match.group(1)
+                        if format_name == "opus":
+                            processing_message = (
+                                "⚙️ Preparando audio Opus..."
+                            )
+                        else:
+                            processing_message = (
+                                "⚙️ Convirtiendo audio a MP3..."
                             )
 
-                            downloads[job]["progress"] = min(
-                                100,
-                                max(0, round(percent))
-                            )
+                    elif "[Metadata]" in line:
+                        processing_message = (
+                            "🏷️ Añadiendo metadatos..."
+                        )
 
-                            downloads[job]["message"] = (
-                                "Descargando para móvil... "
-                                + str(
-                                    downloads[job]["progress"]
+                    elif (
+                        "[ThumbnailsConvertor]" in line
+                        or "[EmbedThumbnail]" in line
+                    ):
+                        processing_message = (
+                            "🖼️ Preparando portada..."
+                        )
+
+                    if processing_message is not None:
+
+                        downloads[job]["status"] = "processing"
+
+                        # Durante la conversión MP3 el monitor
+                        # independiente escribe el porcentaje real.
+                        # No mostrar 100% hasta que termine.
+                        if not (
+                            format_name == "mp3"
+                            and processing_message
+                            == "⚙️ Convirtiendo audio a MP3..."
+                        ):
+                            downloads[job]["progress"] = 100
+
+                        downloads[job]["message"] = (
+                            processing_message
+                        )
+
+                        save_mobile_downloads_state()
+
+                    else:
+
+                        match = re.search(
+                            r"(\d+(?:\.\d+)?)%",
+                            line
+                        )
+
+                        if match:
+
+                            try:
+
+                                percent = float(
+                                    match.group(1)
                                 )
-                                + "%"
-                            )
 
-                            now = time.time()
+                                downloads[job]["status"] = "running"
 
-                            if now - last_state_save >= 5:
-                                save_mobile_downloads_state()
-                                last_state_save = now
+                                downloads[job]["progress"] = min(
+                                    100,
+                                    max(0, round(percent))
+                                )
 
-                        except Exception:
-                            pass
+                                downloads[job]["message"] = (
+                                    "Descargando para móvil... "
+                                    + str(
+                                        downloads[job]["progress"]
+                                    )
+                                    + "%"
+                                )
+
+                                now = time.time()
+
+                                if now - last_state_save >= 5:
+                                    save_mobile_downloads_state()
+                                    last_state_save = now
+
+                            except Exception:
+                                pass
 
                 elif process.poll() is not None:
 
@@ -12051,6 +12385,17 @@ def do_download_mobile(
                         "Tiempo de descarga móvil agotado."
                     )
 
+            ffmpeg_progress_stop.set()
+
+            if format_name == "mp3":
+
+                try:
+                    mp3_progress_thread.join(
+                        timeout=2
+                    )
+                except Exception:
+                    pass
+
             returncode = process.wait()
 
             if returncode != 0:
@@ -12061,19 +12406,25 @@ def do_download_mobile(
                     "Error durante la descarga móvil"
                 )
 
-            mp3_files = sorted(
-                job_dir.glob("*.mp3"),
+            audio_files = sorted(
+                (
+                    job_dir.glob("*.mp3")
+                    if format_name == "mp3"
+                    else job_dir.glob("*.opus")
+                ),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True
             )
 
-            if not mp3_files:
+            if not audio_files:
 
                 raise RuntimeError(
-                    "No se encontró el MP3 móvil descargado."
+                    "No se encontró el archivo "
+                    + format_name.upper()
+                    + " móvil descargado."
                 )
 
-            mp3 = mp3_files[0]
+            audio_file = audio_files[0]
 
             downloads[job] = {
                 "status": "done",
@@ -12086,9 +12437,10 @@ def do_download_mobile(
                 "album_title": album_title,
                 "album_track_index": album_track_index,
                 "album_track_total": album_track_total,
-                "file": str(mp3),
-                "filename": mp3.name,
-                "size": mp3.stat().st_size
+                "format": format_name,
+                "file": str(audio_file),
+                "filename": audio_file.name,
+                "size": audio_file.stat().st_size
             }
 
             save_mobile_downloads_state()
@@ -12812,11 +13164,20 @@ class Handler(BaseHTTPRequestHandler):
 
                 size = file_path.stat().st_size
 
+                suffix = file_path.suffix.lower()
+
+                if suffix == ".opus":
+                    content_type = "audio/ogg"
+                    download_name = "download.opus"
+                else:
+                    content_type = "audio/mpeg"
+                    download_name = "download.mp3"
+
                 self.send_response(200)
 
                 self.send_header(
                     "Content-Type",
-                    "audio/mpeg"
+                    content_type
                 )
 
                 self.send_header(
@@ -12826,7 +13187,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 self.send_header(
                     "Content-Disposition",
-                    'attachment; filename="download.mp3"'
+                    'attachment; filename="' + download_name + '"'
                 )
 
                 self.send_header(
@@ -13273,6 +13634,14 @@ class Handler(BaseHTTPRequestHandler):
                     0
                 )
 
+                format_name = str(
+                    data.get("format", "mp3")
+                    or "mp3"
+                ).lower().strip()
+
+                if format_name not in ("mp3", "opus"):
+                    format_name = "mp3"
+
                 downloads[job] = {
                     "status": "queued",
                     "message": "En cola para móvil...",
@@ -13283,7 +13652,8 @@ class Handler(BaseHTTPRequestHandler):
                     "album_group": album_group,
                     "album_title": album_title,
                     "album_track_index": album_track_index,
-                    "album_track_total": album_track_total
+                    "album_track_total": album_track_total,
+                    "format": format_name
                 }
 
                 save_mobile_downloads_state()
@@ -13297,7 +13667,8 @@ class Handler(BaseHTTPRequestHandler):
                         album_group,
                         album_title,
                         album_track_index,
-                        album_track_total
+                        album_track_total,
+                        format_name
                     )
                 )
 
