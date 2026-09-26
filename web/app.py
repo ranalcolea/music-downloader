@@ -474,6 +474,35 @@ def cancel_download(job):
 
             return True, "Descarga cancelada."
 
+        # Trabajo móvil huérfano:
+        # puede quedar en "processing" aunque el proceso
+        # ya haya desaparecido de active_processes.
+        #
+        # En ese caso permitimos cancelarlo igualmente
+        # para que el APK pueda quitarlo de Descargas activas.
+        if (
+            job in downloads
+            and downloads[job].get("type") == "mobile"
+            and downloads[job].get("status") == "processing"
+        ):
+
+            set_download_control(job, "cancelled")
+
+            item = downloads[job]
+
+            item["status"] = "cancelled"
+            item["message"] = "Descarga cancelada."
+
+            add_history(
+                job,
+                item.get("id", ""),
+                item.get("title", "")
+            )
+
+            save_mobile_downloads_state()
+
+            return True, "Descarga cancelada."
+
         return False, "La descarga no está activa."
 
 
@@ -10253,6 +10282,16 @@ def do_download(
                 f"https://www.youtube.com/watch?v={video_id}"
             )
 
+            ffmpeg_progress_file = (
+                DOWNLOAD_DIR /
+                f"ffmpeg-progress-{job}.log"
+            )
+
+            ffmpeg_progress_stop = threading.Event()
+
+            # Duración real de la pista proporcionada por yt-dlp.
+            nav_source_duration = 0.0
+
             command = [
 
                 "yt-dlp",
@@ -10263,7 +10302,7 @@ def do_download(
                 "--newline",
 
                 "--progress-template",
-                "%(progress._percent_str)s",
+                "%(progress._percent_str)s|%(duration)s",
 
                 "--no-overwrites",
 
@@ -10276,6 +10315,13 @@ def do_download(
 
                 "--audio-quality",
                 "0",
+
+                "--postprocessor-args",
+                (
+                    "ExtractAudio:"
+                    "-progress "
+                    + str(ffmpeg_progress_file)
+                ),
 
                 "--embed-thumbnail",
 
@@ -10311,6 +10357,180 @@ def do_download(
             start_time = time.time()
             last_state_save = 0
 
+            # -------------------------------------------------
+            # Monitor independiente del progreso real de FFmpeg.
+            # Controla la conversión MP3 de Navidrome.
+            # -------------------------------------------------
+
+            def monitor_nav_mp3_conversion():
+
+                progress_file = Path(
+                    ffmpeg_progress_file
+                )
+
+                duration = 0.0
+                last_progress = -1
+
+                while not ffmpeg_progress_stop.is_set():
+
+                    try:
+
+                        # Usar primero la duración real proporcionada
+                        # por yt-dlp para esta pista.
+                        if duration <= 0 and nav_source_duration > 0:
+                            duration = nav_source_duration
+
+                        # Fallback: buscar la fuente WebM descargada.
+                        if duration <= 0:
+
+                            webm_files = sorted(
+                                DOWNLOAD_DIR.rglob("*.webm"),
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True
+                            )
+
+                            if webm_files:
+
+                                try:
+
+                                    probe = subprocess.run(
+                                        [
+                                            "ffprobe",
+                                            "-v",
+                                            "error",
+                                            "-show_entries",
+                                            "format=duration",
+                                            "-of",
+                                            "default=noprint_wrappers=1:nokey=1",
+                                            str(webm_files[0])
+                                        ],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=10
+                                    )
+
+                                    value = (
+                                        probe.stdout or ""
+                                    ).strip()
+
+                                    if value:
+                                        duration = float(value)
+
+                                except Exception:
+                                    pass
+
+                        if progress_file.exists():
+
+                            values = {}
+
+                            text = progress_file.read_text(
+                                encoding="utf-8",
+                                errors="ignore"
+                            )
+
+                            for raw_line in text.splitlines():
+
+                                if "=" not in raw_line:
+                                    continue
+
+                                key, value = raw_line.split(
+                                    "=",
+                                    1
+                                )
+
+                                values[key.strip()] = (
+                                    value.strip()
+                                )
+
+                            seconds = 0.0
+
+                            out_time_ms = values.get(
+                                "out_time_ms"
+                            )
+
+                            out_time = values.get(
+                                "out_time"
+                            )
+
+                            if out_time_ms:
+
+                                try:
+                                    seconds = (
+                                        float(out_time_ms)
+                                        / 1000000.0
+                                    )
+                                except Exception:
+                                    seconds = 0.0
+
+                            if seconds <= 0 and out_time:
+
+                                try:
+
+                                    parts = out_time.split(":")
+
+                                    if len(parts) == 3:
+                                        seconds = (
+                                            float(parts[0])
+                                            * 3600
+                                            +
+                                            float(parts[1])
+                                            * 60
+                                            +
+                                            float(parts[2])
+                                        )
+
+                                except Exception:
+                                    seconds = 0.0
+
+                            if duration > 0:
+
+                                percent = round(
+                                    min(
+                                        99,
+                                        max(
+                                            0,
+                                            (
+                                                seconds
+                                                / duration
+                                            ) * 100
+                                        )
+                                    )
+                                )
+
+                                if percent != last_progress:
+
+                                    downloads[job][
+                                        "status"
+                                    ] = "processing"
+
+                                    downloads[job][
+                                        "progress"
+                                    ] = percent
+
+                                    downloads[job][
+                                        "message"
+                                    ] = (
+                                        "⚙️ "
+                                        "Convirtiendo "
+                                        "audio a MP3... "
+                                        + str(percent)
+                                        + "%"
+                                    )
+
+                                    last_progress = percent
+
+                    except Exception:
+                        pass
+
+                    ffmpeg_progress_stop.wait(0.5)
+
+            nav_mp3_progress_thread = threading.Thread(
+                target=monitor_nav_mp3_conversion,
+                daemon=True
+            )
+
+            nav_mp3_progress_thread.start()
+
             while True:
 
                 line = process.stdout.readline()
@@ -10318,8 +10538,50 @@ def do_download(
                 if line:
                     output_lines.append(line)
 
+                    # yt-dlp entrega:
+                    # porcentaje|duración
+                    #
+                    # Ejemplo:
+                    # 42.1%|312.45
+                    duration_match = re.search(
+                        r"\|([0-9]+(?:\.[0-9]+)?)\s*$",
+                        line.strip()
+                    )
+
+                    if duration_match:
+                        try:
+
+                            value = float(
+                                duration_match.group(1)
+                            )
+
+                            if value > 0:
+                                nav_source_duration = value
+
+                        except Exception:
+                            pass
+
                     if len(output_lines) > 100:
                         output_lines.pop(0)
+
+                    # -------------------------------------------------
+                    # Navidrome entra en conversión cuando yt-dlp
+                    # comienza ExtractAudio.
+                    #
+                    # A partir de aquí el monitor de FFmpeg controla
+                    # el porcentaje y evitamos volver a mostrar
+                    # "Descargando...".
+                    # -------------------------------------------------
+
+                    if "[ExtractAudio]" in line:
+
+                        downloads[job]["status"] = "processing"
+
+                        downloads[job]["message"] = (
+                            "⚙️ "
+                            "Convirtiendo "
+                            "audio a MP3..."
+                        )
 
                     match = re.search(
                         r"(\d+(?:\.\d+)?)%",
@@ -10329,22 +10591,30 @@ def do_download(
                     if match:
 
                         try:
-                            percent = float(
-                                match.group(1)
-                            )
 
-                            downloads[job]["progress"] = min(
-                                100,
-                                max(0, round(percent))
-                            )
+                            # Cuando FFmpeg está convirtiendo,
+                            # el monitor independiente controla
+                            # tanto la barra como el mensaje.
+                            if downloads[job].get(
+                                "status"
+                            ) != "processing":
 
-                            downloads[job]["message"] = (
-                                "Descargando... "
-                                + str(
-                                    downloads[job]["progress"]
+                                percent = float(
+                                    match.group(1)
                                 )
-                                + "%"
-                            )
+
+                                downloads[job]["progress"] = min(
+                                    100,
+                                    max(0, round(percent))
+                                )
+
+                                downloads[job]["message"] = (
+                                    "Descargando... "
+                                    + str(
+                                        downloads[job]["progress"]
+                                    )
+                                    + "%"
+                                )
 
                         except Exception:
                             pass
@@ -10375,6 +10645,15 @@ def do_download(
                     raise RuntimeError(
                         "Tiempo de descarga agotado."
                     )
+
+            ffmpeg_progress_stop.set()
+
+            try:
+                nav_mp3_progress_thread.join(
+                    timeout=2
+                )
+            except Exception:
+                pass
 
             returncode = process.wait()
 
