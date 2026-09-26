@@ -10,6 +10,8 @@ import threading
 import urllib.parse
 import urllib.request
 import queue
+import requests
+from bs4 import BeautifulSoup
 import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11751,6 +11753,239 @@ def save_spotify_playlist(result):
     return playlist
 
 
+def spotify_parse_spotify_url(url):
+
+    url = (url or "").strip()
+
+    if not url:
+        raise ValueError(
+            "La URL de Spotify está vacía."
+        )
+
+    parsed = urllib.parse.urlparse(url)
+
+    if parsed.netloc.lower() not in {
+        "open.spotify.com",
+        "www.open.spotify.com"
+    }:
+        raise ValueError(
+            "La URL no parece ser de Spotify."
+        )
+
+    parts = [
+        part
+        for part in parsed.path.split("/")
+        if part
+    ]
+
+    if (
+        len(parts) < 2
+        or parts[0].lower() != "playlist"
+    ):
+        raise ValueError(
+            "La URL debe apuntar a una playlist de Spotify."
+        )
+
+    playlist_id = parts[1].strip()
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9]+",
+        playlist_id
+    ):
+        raise ValueError(
+            "ID de playlist de Spotify no válido."
+        )
+
+    embed_url = (
+        "https://open.spotify.com/embed/playlist/"
+        + playlist_id
+    )
+
+    response = requests.get(
+        embed_url,
+        timeout=20,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/151.0 Safari/537.36"
+            ),
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+        }
+    )
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+    # Nombre de la playlist y propietario.
+    metadata_container = soup.select_one(
+        ".TrackListWidget_metadataContainer__EP9LF"
+    )
+
+    playlist_name = ""
+
+    if metadata_container:
+        spans = metadata_container.select(
+            "span"
+        )
+
+        for span in spans:
+            value = span.get_text(
+                " ",
+                strip=True
+            )
+
+            if value:
+                if value.lower() not in {
+                    "·"
+                }:
+                    playlist_name = value
+                    break
+
+    if not playlist_name:
+        title_element = soup.select_one(
+            "title"
+        )
+
+        if title_element:
+            playlist_name = title_element.get_text(
+                " ",
+                strip=True
+            )
+
+    if playlist_name and " · " in playlist_name:
+        playlist_name = playlist_name.split(
+            " · ",
+            1
+        )[0].strip()
+
+    if not playlist_name:
+        playlist_name = (
+            "Playlist Spotify "
+            + playlist_id
+        )
+
+    rows = soup.select(
+        'li[data-testid^="tracklist-row-"]'
+    )
+
+    if not rows:
+        raise ValueError(
+            "Spotify no ha devuelto canciones "
+            "para esta playlist."
+        )
+
+    tracks = []
+
+    for row in rows:
+
+        title_element = row.select_one(
+            "h3"
+        )
+
+        artist_element = row.select_one(
+            "h4"
+        )
+
+        duration_element = row.select_one(
+            'div[data-testid="duration-cell"]'
+        )
+
+        title = (
+            title_element.get_text(
+                " ",
+                strip=True
+            )
+            if title_element
+            else ""
+        )
+
+        artist = (
+            artist_element.get_text(
+                " ",
+                strip=True
+            )
+            if artist_element
+            else ""
+        )
+
+        duration_text = (
+            duration_element.get_text(
+                " ",
+                strip=True
+            )
+            if duration_element
+            else ""
+        )
+
+        duration = 0
+
+        try:
+
+            parts = duration_text.split(":")
+
+            if len(parts) == 2:
+
+                minutes = int(parts[0])
+                seconds = int(parts[1])
+
+                duration = (
+                    minutes * 60
+                    + seconds
+                )
+
+            elif len(parts) == 3:
+
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = int(parts[2])
+
+                duration = (
+                    hours * 3600
+                    + minutes * 60
+                    + seconds
+                )
+
+        except Exception:
+            duration = 0
+
+        if not title:
+            continue
+
+        tracks.append({
+            "title": title,
+            "artist": artist,
+            "album": "",
+            "duration": duration
+        })
+
+    if not tracks:
+        raise ValueError(
+            "No se encontraron canciones "
+            "en la playlist de Spotify."
+        )
+
+    return {
+        "name": playlist_name,
+        "count": len(tracks),
+        "tracks": tracks,
+        "url": (
+            "https://open.spotify.com/playlist/"
+            + playlist_id
+        ),
+        "spotify_url": (
+            "https://open.spotify.com/playlist/"
+            + playlist_id
+        )
+    }
+
+
 def spotify_parse_playlist(filename, content):
 
     name = Path(
@@ -13474,33 +13709,47 @@ class Handler(BaseHTTPRequestHandler):
 
                 data = json.loads(body)
 
-                filename = data.get(
-                    "filename",
-                    "playlist.txt"
-                )
+                spotify_url = (
+                    data.get("url")
+                    or data.get("spotify_url")
+                    or ""
+                ).strip()
 
-                content = data.get(
-                    "content",
-                    ""
-                )
+                if spotify_url:
 
-                if not content:
-                    raise ValueError(
-                        "El archivo está vacío."
+                    result = spotify_parse_spotify_url(
+                        spotify_url
                     )
 
-                result = spotify_parse_playlist(
-                    filename,
-                    content
-                )
+                else:
+
+                    filename = data.get(
+                        "filename",
+                        "playlist.txt"
+                    )
+
+                    content = data.get(
+                        "content",
+                        ""
+                    )
+
+                    if not content:
+                        raise ValueError(
+                            "El archivo está vacío."
+                        )
+
+                    result = spotify_parse_playlist(
+                        filename,
+                        content
+                    )
 
                 saved_playlist = save_spotify_playlist(
                     result
                 )
 
                 if saved_playlist:
-                    result["saved_id"] = saved_playlist.get(
-                        "id"
+                    result["saved_id"] = (
+                        saved_playlist.get("id")
                     )
 
                 self.send_json(
