@@ -10105,14 +10105,197 @@ async function spotifyDownloadSelected() {
 """
 
 
-def search_youtube(query):
+# ============================================================
+# CACHE CONJUNTA DE BÚSQUEDAS YOUTUBE
+# Compartida por:
+#   - búsqueda normal
+#   - búsqueda de álbumes
+#   - Spotify
+#
+# La caché vive mientras el backend está ejecutándose.
+# ============================================================
+
+YOUTUBE_CACHE = {}
+
+YOUTUBE_CACHE_LOCK = threading.Lock()
+
+YOUTUBE_CACHE_TTL = 6 * 60 * 60
+
+YOUTUBE_CACHE_MAX_ENTRIES = 500
+
+
+def _youtube_cache_key(query):
+
+    query = str(
+        query or ""
+    ).strip()
+
+    # Normalizamos separadores habituales.
+    # Así estas consultas comparten caché:
+    #
+    #   Pink Floyd Time
+    #   Pink Floyd - Time
+    #   Pink Floyd – Time
+    #   Pink Floyd — Time
+    #
+    query = (
+        query
+        .replace("-", " ")
+        .replace("–", " ")
+        .replace("—", " ")
+    )
+
+    # Normalizamos espacios y mayúsculas.
+    return " ".join(
+        query.split()
+    ).casefold()
+
+
+def _youtube_cache_get(query, limit):
+
+    key = _youtube_cache_key(query)
+
+    if not key:
+        return None
+
+    now = time.time()
+
+    with YOUTUBE_CACHE_LOCK:
+
+        item = YOUTUBE_CACHE.get(key)
+
+        if not item:
+            return None
+
+        age = now - item["time"]
+
+        if age >= YOUTUBE_CACHE_TTL:
+
+            del YOUTUBE_CACHE[key]
+
+            print(
+                "YOUTUBE CACHE EXPIRED:",
+                query
+            )
+
+            return None
+
+        # Una búsqueda con más resultados sirve para
+        # una petición que necesita menos resultados.
+        if item["limit"] < limit:
+
+            return None
+
+        print(
+            "YOUTUBE CACHE HIT:",
+            query,
+            "limit=",
+            limit
+        )
+
+        return [
+            dict(result)
+            for result in item["results"][:limit]
+        ]
+
+
+def _youtube_cache_put(query, limit, results):
+
+    key = _youtube_cache_key(query)
+
+    if not key:
+        return
+
+    now = time.time()
+
+    with YOUTUBE_CACHE_LOCK:
+
+        # Si ya tenemos una búsqueda con más resultados,
+        # no la sustituimos por una versión más pequeña.
+        previous = YOUTUBE_CACHE.get(key)
+
+        if (
+            previous
+            and previous["limit"] > limit
+        ):
+            return
+
+        YOUTUBE_CACHE[key] = {
+            "time": now,
+            "limit": limit,
+            "results": [
+                dict(result)
+                for result in results
+            ]
+        }
+
+        # Eliminamos entradas antiguas primero.
+        expired = [
+            cache_key
+            for cache_key, value
+            in YOUTUBE_CACHE.items()
+            if now - value["time"] >= YOUTUBE_CACHE_TTL
+        ]
+
+        for cache_key in expired:
+            YOUTUBE_CACHE.pop(
+                cache_key,
+                None
+            )
+
+        # Límite absoluto de memoria.
+        while (
+            len(YOUTUBE_CACHE)
+            > YOUTUBE_CACHE_MAX_ENTRIES
+        ):
+
+            oldest_key = min(
+                YOUTUBE_CACHE,
+                key=lambda cache_key:
+                    YOUTUBE_CACHE[cache_key]["time"]
+            )
+
+            YOUTUBE_CACHE.pop(
+                oldest_key,
+                None
+            )
+
+        print(
+            "YOUTUBE CACHE STORE:",
+            query,
+            "limit=",
+            limit,
+            "results=",
+            len(results),
+            "entries=",
+            len(YOUTUBE_CACHE)
+        )
+
+
+def search_youtube(query, limit=100):
+
+    cached = _youtube_cache_get(
+        query,
+        limit
+    )
+
+    if cached is not None:
+
+        return cached
+
+    print(
+        "YOUTUBE CACHE MISS:",
+        query,
+        "limit=",
+        limit
+    )
 
     command = [
         "yt-dlp",
         "--flat-playlist",
         "--dump-single-json",
         "--skip-download",
-        f"ytsearch100:{query}"
+        f"ytsearch{limit}:{query}"
     ]
 
     result = subprocess.run(
@@ -10195,6 +10378,12 @@ def search_youtube(query):
             result.stderr.strip()
             or "yt-dlp no encontró resultados"
         )
+
+    _youtube_cache_put(
+        query,
+        limit,
+        output
+    )
 
     return output
 
@@ -12335,7 +12524,7 @@ def spotify_search_and_queue(tracks):
 
         try:
 
-            results = search_youtube(query)
+            results = search_youtube(query, 5)
 
             if not results:
 
@@ -13109,7 +13298,7 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                results = search_youtube(query)
+                results = search_youtube(query, 5)
 
                 if not results:
                     self.send_json(
@@ -13121,7 +13310,160 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
-                result = results[0]
+                # Selección inteligente entre los 5 resultados.
+                #
+                # La APK envía:
+                #     artista - canción
+                #
+                # Priorizamos coincidencia de artista y título.
+                # Si varios resultados son equivalentes, se conserva
+                # la posición original devuelta por YouTube.
+
+                import re
+                import unicodedata
+
+                def normalize_album_result(value):
+
+                    value = unicodedata.normalize(
+                        "NFKD",
+                        value or ""
+                    )
+
+                    value = "".join(
+                        char
+                        for char in value
+                        if not unicodedata.combining(char)
+                    )
+
+                    value = value.lower()
+
+                    value = re.sub(
+                        r"[^a-z0-9]+",
+                        " ",
+                        value
+                    )
+
+                    return " ".join(
+                        value.split()
+                    )
+
+                parts = re.split(
+                    r"\s+-\s+",
+                    query,
+                    maxsplit=1
+                )
+
+                if len(parts) == 2:
+
+                    wanted_artist = normalize_album_result(
+                        parts[0]
+                    )
+
+                    wanted_title = normalize_album_result(
+                        parts[1]
+                    )
+
+                else:
+
+                    wanted_artist = ""
+
+                    wanted_title = normalize_album_result(
+                        query
+                    )
+
+                scored_results = []
+
+                for position, candidate in enumerate(
+                    results
+                ):
+
+                    candidate_title = normalize_album_result(
+                        candidate.get("title", "")
+                    )
+
+                    candidate_channel = normalize_album_result(
+                        candidate.get("channel", "")
+                    )
+
+                    score = 0
+
+                    # Artista presente en el título.
+                    if (
+                        wanted_artist
+                        and wanted_artist in candidate_title
+                    ):
+                        score += 40
+
+                    # Canal coincide con el artista.
+                    if (
+                        wanted_artist
+                        and wanted_artist in candidate_channel
+                    ):
+                        score += 50
+
+                    # Título completo.
+                    if (
+                        wanted_title
+                        and wanted_title in candidate_title
+                    ):
+                        score += 50
+
+                    # Palabras importantes del título.
+                    if wanted_title:
+
+                        title_words = [
+                            word
+                            for word in wanted_title.split()
+                            if len(word) >= 3
+                        ]
+
+                        for word in title_words:
+
+                            if word in candidate_title:
+                                score += 6
+
+                    # Penalizamos resultados claramente
+                    # alternativos o no deseados.
+                    penalties = {
+                        "lyrics": -30,
+                        "cover": -45,
+                        "karaoke": -45,
+                        "remix": -20,
+                        "sped up": -20,
+                        "slowed": -20,
+                        "nightcore": -30,
+                    }
+
+                    for word, points in penalties.items():
+
+                        if word in candidate_title:
+                            score += points
+
+                    # Solo desempate por posición.
+                    # NO premiamos Official Audio/Video,
+                    # para no cambiar versiones válidas.
+                    score += max(
+                        0,
+                        5 - position
+                    )
+
+                    scored_results.append(
+                        (
+                            score,
+                            position,
+                            candidate
+                        )
+                    )
+
+                scored_results.sort(
+                    key=lambda item: (
+                        item[0],
+                        -item[1]
+                    ),
+                    reverse=True
+                )
+
+                result = scored_results[0][2]
 
                 self.send_json(
                     {
