@@ -3,3 +3,31 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Music Downloader - archivos locales
+/downloads/
+/mobile-downloads/
+/cache/
+/data/
+/backups/
+/shazam-venv/
+
+# Datos privados y archivos descargados
+/download-history.json
+/mobile-downloads.json
+/urls.txt
+/*.mp3
+/*.m4a
+/*.opus
+/*.flac
+/*.wav
+/*.mp4
+/*.webm
+
+# Copias de seguridad
+*.bak
+*.bak*
+*.BACK*
+*.backup*
+*.FALLO_*
+*.FINAL_*

@@ -9,6 +9,7 @@ import signal
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 import queue
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +17,10 @@ import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from music_cache import cache_get, cache_put
+
+# Máximo dos identificaciones simultáneas.
+SHAZAM_RECOGNITION_SEMAPHORE = threading.BoundedSemaphore(2)
 
 HOST = "0.0.0.0"
 PORT = 8080
@@ -10119,9 +10124,9 @@ YOUTUBE_CACHE = {}
 
 YOUTUBE_CACHE_LOCK = threading.Lock()
 
-YOUTUBE_CACHE_TTL = 24 * 60 * 60
+YOUTUBE_CACHE_TTL = 3 * 24 * 60 * 60
 
-YOUTUBE_CACHE_MAX_ENTRIES = 500
+YOUTUBE_CACHE_MAX_ENTRIES = 100
 
 
 def _youtube_cache_key(query):
@@ -10283,6 +10288,43 @@ def search_youtube(query, limit=100):
 
         return cached
 
+    # Segundo nivel: caché persistente SSD
+    disk_key = _youtube_cache_key(query)
+
+    if disk_key:
+        try:
+            disk_item = cache_get("youtube", disk_key)
+
+            if (
+                isinstance(disk_item, dict)
+                and isinstance(disk_item.get("results"), list)
+                and int(disk_item.get("limit", 0)) >= limit
+            ):
+                print(
+                    "YOUTUBE DISK CACHE HIT:",
+                    query,
+                    "limit=",
+                    limit,
+                    flush=True
+                )
+
+                results = disk_item["results"][:limit]
+
+                _youtube_cache_put(
+                    query,
+                    int(disk_item["limit"]),
+                    disk_item["results"]
+                )
+
+                return [dict(item) for item in results]
+
+        except Exception as error:
+            print(
+                "YOUTUBE DISK CACHE ERROR:",
+                repr(error),
+                flush=True
+            )
+
     print(
         "YOUTUBE CACHE MISS:",
         query,
@@ -10385,6 +10427,62 @@ def search_youtube(query, limit=100):
         output
     )
 
+    # Guardar también en SSD
+    if disk_key:
+        try:
+            previous = cache_get("youtube", disk_key)
+
+            if not (
+                isinstance(previous, dict)
+                and int(previous.get("limit", 0)) > limit
+            ):
+                cache_put(
+                    "youtube",
+                    disk_key,
+                    {
+                        "limit": limit,
+                        "results": output
+                    }
+                )
+
+                print(
+                    "YOUTUBE DISK CACHE STORE:",
+                    query,
+                    "limit=",
+                    limit,
+                    flush=True
+                )
+
+        except Exception as error:
+            print(
+                "YOUTUBE DISK CACHE ERROR:",
+                repr(error),
+                flush=True
+            )
+
+
+    # APRENDIZAJE_SUGERENCIAS_V3
+    try:
+        for song in output[:50]:
+            if not isinstance(song, dict):
+                continue
+
+            title = song.get("title", "")
+            channel = song.get("channel", "")
+
+            if title:
+                smart_catalog_add(title, "song")
+
+            if channel:
+                smart_catalog_add(channel, "artist")
+
+    except Exception as error:
+        print(
+            "SMART YOUTUBE LEARNING ERROR:",
+            repr(error),
+            flush=True
+        )
+
     return output
 
 
@@ -10484,6 +10582,14 @@ def do_download(
             command = [
 
                 "yt-dlp",
+                # DESCARGAS_REINTENTOS_YTDLP_V1
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "--extractor-retries", "3",
+                "--retry-sleep", "http:2",
+                "--retry-sleep", "fragment:2",
+                "--retry-sleep", "extractor:2",
+
 
                 "--js-runtimes",
                 "node",
@@ -11143,9 +11249,7 @@ def album_musicbrainz_tracks(release_id):
 
 def album_find_youtube(artist, title):
 
-    query = (
-        artist + " " + title
-    ).strip()
+    query = (artist + " " + title).strip()
 
     try:
 
@@ -11167,36 +11271,131 @@ def album_find_youtube(artist, title):
         if process.returncode != 0:
             return None
 
-        data = json.loads(
-            process.stdout
-        )
+        data = json.loads(process.stdout)
+        entries = data.get("entries", [])
 
-        entries = data.get(
-            "entries",
-            []
-        )
+        # Si artista + cancion no encuentra nada,
+        # probar cancion + artista.
+        if not entries:
+
+            fallback_query = (
+                title + " " + artist
+            ).strip()
+
+            fallback_process = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--flat-playlist",
+                    "--dump-single-json",
+                    "--skip-download",
+                    "ytsearch10:" + fallback_query
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20
+            )
+
+            if fallback_process.returncode == 0:
+
+                fallback_data = json.loads(
+                    fallback_process.stdout
+                )
+
+                entries = fallback_data.get(
+                    "entries",
+                    []
+                )
 
         if not entries:
             return None
 
-        wanted = title.lower()
+        import unicodedata
 
-        # Primera opción: título de YouTube
-        # que contenga el nombre exacto.
-        for item in entries:
+        def norm(value):
 
-            item_title = str(
-                item.get(
-                    "title",
-                    ""
-                )
+            value = unicodedata.normalize(
+                "NFD",
+                str(value or "").casefold()
             )
 
-            if wanted in item_title.lower():
+            value = "".join(
+                c for c in value
+                if unicodedata.category(c) != "Mn"
+            )
 
-                return item
+            return " ".join(
+                re.findall(r"[a-z0-9]+", value)
+            )
 
-        return entries[0]
+        wanted_artist = norm(artist)
+        wanted_song = norm(title)
+
+        def score(item):
+
+            item_title = norm(
+                item.get("title")
+            )
+
+            channel = norm(
+                item.get("channel")
+                or item.get("uploader")
+            )
+
+            points = 0
+
+            # La canción correcta tiene prioridad.
+            if wanted_song in item_title:
+                points += 150
+
+            # Preferencia fuerte por el canal
+            # del propio artista.
+            if channel == wanted_artist:
+                points += 120
+
+            elif channel in (
+                wanted_artist + " oficial",
+                wanted_artist + " official",
+                wanted_artist + " topic"
+            ):
+                points += 120
+
+            elif wanted_artist in channel:
+                points += 30
+
+            # Penalizar contenido que normalmente
+            # no corresponde a la pista del álbum.
+            bad = (
+                "cover",
+                "karaoke",
+                "tributo",
+                "tribute",
+                "remix",
+                "reaction",
+                "full album",
+                "album completo",
+                "greatest hits",
+                "grandes exitos",
+                "grandes sucessos"
+            )
+
+            if any(
+                term in item_title
+                for term in bad
+            ):
+                points -= 100
+
+            if (
+                "lyrics" in item_title
+                or "letra" in item_title
+            ):
+                points -= 25
+
+            return points
+
+        return max(
+            entries,
+            key=score
+        )
 
     except Exception as error:
 
@@ -11209,7 +11408,7 @@ def album_find_youtube(artist, title):
         return None
 
 
-def search_album_backend(query):
+def _search_album_backend_uncached(query):
     """
     Busca álbumes en MusicBrainz.
 
@@ -11321,32 +11520,46 @@ def search_album_backend(query):
 
         if artist_id:
 
-            release_group_url = (
-                "https://musicbrainz.org/ws/2/release-group/"
-                "?artist=" + urllib.parse.quote(artist_id)
-                + "&fmt=json&limit=100"
-            )
+            groups = []
+            vistos = set()
 
-            try:
-
-                group_data = musicbrainz_request(
-                    release_group_url
+            for offset in range(0, 200, 100):
+                release_group_url = (
+                    "https://musicbrainz.org/ws/2/release-group/"
+                    "?artist=" + urllib.parse.quote(artist_id)
+                    + "&type=album%7Cep"
+                    + "&fmt=json&limit=100&offset=" + str(offset)
                 )
 
-                groups = group_data.get(
-                    "release-groups",
-                    []
-                )
+                try:
+                    if offset:
+                        time.sleep(1.1)
 
-            except Exception as error:
+                    group_data = musicbrainz_request(release_group_url)
 
-                print(
-                    "ERROR MusicBrainz release-groups:",
-                    repr(error),
-                    flush=True
-                )
+                except Exception as error:
+                    print("ERROR MusicBrainz:", repr(error), flush=True)
+                    if not groups:
+                        raise RuntimeError(
+                            "No se pudo cargar la discografía."
+                        ) from error
+                    break
 
-                groups = []
+                lote = group_data.get("release-groups", [])
+
+                for group in lote:
+                    gid = group.get("id")
+                    if gid and gid not in vistos:
+                        vistos.add(gid)
+                        groups.append(group)
+
+                total = group_data.get("count", 0)
+
+                if len(lote) < 100:
+                    break
+
+                if total and offset + len(lote) >= total:
+                    break
 
             albums = []
 
@@ -11370,21 +11583,42 @@ def search_album_backend(query):
                 ):
                     continue
 
+                secundarios = group.get("secondary-types") or []
+
+                secundarios = {
+                    str(tipo).casefold()
+                    for tipo in secundarios
+                }
+
+                if "live" in secundarios:
+                    prioridad = 3
+                elif "compilation" in secundarios:
+                    prioridad = 2
+                elif group_type == "EP":
+                    prioridad = 1
+                else:
+                    prioridad = 0
+
                 albums.append({
                     "id": group.get("id", ""),
                     "title": title,
                     "artist": artist_name,
                     "date": group.get("first-release-date", ""),
                     "type": group_type,
-                    "tracks": []
+                    "tracks": [],
+                    "_prioridad": prioridad
                 })
 
             albums.sort(
                 key=lambda x: (
+                    x["_prioridad"],
                     x.get("date") or "9999",
                     x.get("title", "").lower()
                 )
             )
+
+            for album in albums:
+                album.pop("_prioridad", None)
 
             if albums:
 
@@ -11393,169 +11627,349 @@ def search_album_backend(query):
                     "artist": artist_name
                 }
 
-    # -----------------------------------------------------
-    # 3. No es artista: buscar álbum concreto
-    # -----------------------------------------------------
+    # BUSQUEDA_ALBUMES_PRECISA_V2
+    # No seleccionar automáticamente releases[0].
+    # Android necesita una lista de álbumes seleccionables.
+
+    import unicodedata
+
+    def normalize_search_text(value):
+        value = unicodedata.normalize(
+            "NFKD", str(value or "")
+        )
+        value = "".join(
+            c for c in value
+            if not unicodedata.combining(c)
+        )
+        value = re.sub(r"[^a-z0-9]+", " ", value.lower())
+        return " ".join(value.split())
+
+    wanted = normalize_search_text(query)
+    wanted_words = wanted.split()
 
     search_url = (
-        "https://musicbrainz.org/ws/2/release/"
+        "https://musicbrainz.org/ws/2/release-group/"
         "?query=" + urllib.parse.quote(query)
-        + "&fmt=json&limit=1"
+        + "&fmt=json&limit=100"
     )
 
     try:
-
-        data = musicbrainz_request(
-            search_url
-        )
-
+        data = musicbrainz_request(search_url)
     except Exception as error:
-
-        print(
-            "ERROR MusicBrainz búsqueda:",
-            repr(error),
-            flush=True
-        )
-
         raise RuntimeError(
-            "MusicBrainz está temporalmente ocupado. Inténtalo de nuevo en unos segundos."
+            "MusicBrainz está temporalmente ocupado."
+        ) from error
+
+    groups = data.get("release-groups", [])
+    albums = []
+    seen = set()
+
+    for group in groups:
+        gid = group.get("id", "")
+        title = str(group.get("title", "")).strip()
+
+        credits = group.get("artist-credit", [])
+        artist = " ".join(
+            str(c.get("artist", {}).get("name", ""))
+            for c in credits
+            if isinstance(c, dict)
+        ).strip()
+
+        if not gid or not title or gid in seen:
+            continue
+
+        normalized_title = normalize_search_text(title)
+        normalized_artist = normalize_search_text(artist)
+
+        combined = normalized_artist + " " + normalized_title
+
+        if not wanted_words:
+            continue
+
+        matches = sum(
+            1 for word in wanted_words
+            if word in combined.split()
         )
 
-    releases = data.get(
-        "releases",
-        []
-    )
+        if matches == 0:
+            continue
 
-    if not releases:
+        seen.add(gid)
 
-        return {
-            "title": "",
-            "artist": "",
-            "tracks": []
-        }
+        secondary = [
+            str(value).casefold()
+            for value in group.get("secondary-types", [])
+        ]
 
-    release = releases[0]
-
-    release_id = release.get("id")
-
-    if not release_id:
-
-        raise RuntimeError(
-            "MusicBrainz no devolvió el identificador del álbum."
-        )
-
-    album_title = release.get(
-        "title",
-        query
-    )
-
-    artist = ""
-
-    artist_credit = release.get(
-        "artist-credit",
-        []
-    )
-
-    if artist_credit:
-
-        artist = (
-            artist_credit[0]
-            .get("artist", {})
-            .get("name", "")
-        )
-
-    # -----------------------------------------------------
-    # 4. Obtener detalle y canciones
-    # -----------------------------------------------------
-
-    detail_url = (
-        "https://musicbrainz.org/ws/2/release/"
-        + urllib.parse.quote(release_id)
-        + "?inc=recordings%2Bartist-credits&fmt=json"
-    )
-
-    try:
-
-        detail = musicbrainz_request(
-            detail_url
-        )
-
-    except Exception as error:
-
-        print(
-            "ERROR MusicBrainz detalle:",
-            repr(error),
-            flush=True
-        )
-
-        raise RuntimeError(
-            "No se pudo obtener el contenido del álbum."
-        )
-
-    tracks = []
-    track_number = 0
-
-    for medium in detail.get(
-        "media",
-        []
-    ):
-
-        for track in medium.get(
-            "tracks",
-            []
-        ):
-
-            recording = track.get(
-                "recording",
-                {}
+        albums.append({
+            "id": gid,
+            "title": title,
+            "artist": artist,
+            "date": group.get("first-release-date", ""),
+            "type": (
+                "live" if "live" in secondary
+                else str(group.get("primary-type", "Album"))
+            ),
+            "tracks": [],
+            "_primary_type": str(
+                group.get("primary-type", "")
+            ),
+            "_secondary_types": list(
+                group.get("secondary-types") or []
+            ),
+            "_rank": (
+                matches,
+                int(normalized_title == wanted),
+                int(wanted in combined),
+                group.get("score", 0)
             )
+        })
 
-            title = (
-                recording.get("title")
-                or track.get("title")
-                or ""
-            ).strip()
+        # BUSQUEDA_ALBUMES_RANKING_V4
+    # Comparar títulos exactos y artistas múltiples.
+    import unicodedata
 
-            if not title:
-                continue
+    def compact_album_text(value):
+        normalized = unicodedata.normalize(
+            "NFKD", str(value or "")
+        ).casefold()
+        return "".join(
+            char for char in normalized
+            if char.isalnum()
+            and not unicodedata.combining(char)
+        )
 
-            track_number += 1
+    def rank_album(album):
+        title = album.get("title", "")
+        artist = album.get("artist", "")
+        primary = album.get("_primary_type", "")
+        secondary = album.get("_secondary_types", [])
 
-            duration_ms = (
-                recording.get("length")
-                or track.get("length")
-                or 0
+        title_key = compact_album_text(title)
+        artist_key = compact_album_text(artist)
+        query_key = compact_album_text(query)
+
+        # Un álbum puede tener varios intérpretes acreditados.
+        remaining = query_key
+        artist_match_length = 0
+
+        words = normalize_search_text(artist).split()
+
+        for length in range(len(words), 0, -1):
+            part = compact_album_text(
+                " ".join(words[:length])
             )
+            if part and query_key.startswith(part):
+                remaining = query_key[len(part):]
+                artist_match_length = len(part)
+                break
 
-            duration = 0
+        # Para Metallica S&M:
+        # artista = Metallica
+        # álbum = S&M
+        exact_album = bool(
+            remaining and remaining == title_key
+        )
 
-            try:
+        exact_combined = (
+            artist_key + title_key == query_key
+        )
 
-                if duration_ms:
-                    duration = int(
-                        duration_ms
-                    ) // 1000
+        exact_title = title_key == query_key
 
-            except Exception:
-                duration = 0
+        full_album = primary.casefold() == "album"
+        compilation = "compilation" in [
+            str(x).casefold() for x in secondary
+        ]
 
-            tracks.append({
-                "number": track_number,
-                "title": title,
-                "artist": artist,
-                "album": album_title,
-                "id": "",
-                "video_id": "",
-                "thumbnail": "",
-                "duration": duration
-            })
+        return (
+            int(exact_album and full_album and not compilation),
+            int(exact_album),
+            int(exact_combined),
+            int(exact_title),
+            int(full_album and not compilation),
+            artist_match_length,
+            album["_rank"]
+        )
+
+    albums.sort(
+        key=rank_album,
+        reverse=True
+    )
+    for album in albums:
+        album.pop("_rank", None)
+        album.pop("_primary_type", None)
+        album.pop("_secondary_types", None)
 
     return {
-        "id": release_id,
-        "title": album_title,
-        "artist": artist,
-        "tracks": tracks
+        "albums": albums,
+        "artist": ""
     }
+
+
+
+# MUSICBRAINZ_SUGERENCIAS_V6
+
+
+def smart_learn_musicbrainz(result):
+    if not isinstance(result, dict):
+        return
+
+    artist = result.get("artist", "")
+
+    if artist:
+        smart_catalog_add(
+            artist,
+            "mb_artist"
+        )
+
+    title = result.get("title", "")
+
+    if title:
+        smart_catalog_add(
+            title,
+            "album",
+            artist=artist
+        )
+
+    albums = result.get("albums", [])
+
+    if isinstance(albums, list):
+        for album in albums[:200]:
+            if not isinstance(album, dict):
+                continue
+
+            album_artist = album.get("artist", artist)
+
+            smart_catalog_add(
+                album.get("title", ""),
+                "album",
+                artist=album_artist,
+                mbid=album.get("id", ""),
+                date=album.get("date", ""),
+                album_type=album.get("type", "")
+            )
+
+            if album_artist:
+                smart_catalog_add(
+                    album_artist,
+                    "mb_artist"
+                )
+
+    tracks = result.get("tracks", [])
+
+    if isinstance(tracks, list):
+        for track in tracks[:100]:
+            if not isinstance(track, dict):
+                continue
+
+            smart_catalog_add(
+                track.get("title", ""),
+                "song",
+                artist=artist
+            )
+
+
+
+def search_album_backend(query):
+    cache_key = "album_search_v4:" + " ".join(str(query or "").split()).casefold()
+
+    if cache_key:
+        try:
+            cached = cache_get("musicbrainz_search", cache_key)
+
+            if cached is not None:
+                try:
+                    smart_learn_musicbrainz(cached)
+                except Exception as error:
+                    print("SMART CACHE ERROR:", repr(error))
+                print(
+                    "MUSICBRAINZ SEARCH CACHE HIT:",
+                    cache_key,
+                    flush=True
+                )
+                return cached
+
+        except Exception as error:
+            print(
+                "MUSICBRAINZ SEARCH CACHE ERROR:",
+                repr(error),
+                flush=True
+            )
+
+    result = _search_album_backend_uncached(query)
+
+    if cache_key and result:
+        try:
+            cache_put(
+                "musicbrainz_search",
+                cache_key,
+                result
+            )
+
+            print(
+                "MUSICBRAINZ SEARCH CACHE STORE:",
+                cache_key,
+                flush=True
+            )
+
+        except Exception as error:
+            print(
+                "MUSICBRAINZ SEARCH CACHE ERROR:",
+                repr(error),
+                flush=True
+            )
+
+
+    # APRENDIZAJE_SUGERENCIAS_V3
+    try:
+        if isinstance(result, dict):
+            artist = result.get("artist", "")
+            title = result.get("title", "")
+
+            if artist:
+                smart_catalog_add(artist, "artist")
+
+            if title:
+                smart_catalog_add(title, "album")
+
+            for album in result.get("albums", [])[:100]:
+                if not isinstance(album, dict):
+                    continue
+
+                smart_catalog_add(
+                    album.get("title", ""),
+                    "album"
+                )
+
+                smart_catalog_add(
+                    album.get("artist", ""),
+                    "artist"
+                )
+
+            for track in result.get("tracks", [])[:100]:
+                if not isinstance(track, dict):
+                    continue
+
+                smart_catalog_add(
+                    track.get("title", ""),
+                    "song"
+                )
+
+    except Exception as error:
+        print(
+            "SMART ALBUM LEARNING ERROR:",
+            repr(error),
+            flush=True
+        )
+
+    try:
+        smart_learn_musicbrainz(result)
+    except Exception as error:
+        print("SMART MB ERROR:", repr(error))
+
+    return result
+
 
 
 
@@ -11568,6 +11982,26 @@ def load_album_by_release_group(
     Obtiene una edición del release-group y devuelve
     el álbum con sus canciones.
     """
+
+    cache_key = str(release_group_id or "").strip().lower()
+
+    if cache_key:
+        cached = cache_get("musicbrainz_album", cache_key)
+
+        if (
+            isinstance(cached, dict)
+            and cached.get("tracks")
+            and "album_type" in cached
+        ):
+            print("MUSICBRAINZ ALBUM CACHE HIT:", cache_key, flush=True)
+            return cached
+
+        if isinstance(cached, dict) and cached.get("tracks"):
+            print(
+                "MUSICBRAINZ ALBUM CACHE ANTIGUA, ACTUALIZANDO:",
+                cache_key,
+                flush=True
+            )
 
     headers = {
         "User-Agent": "MusicDownloader/1.0 (RaspberryPi)"
@@ -11626,7 +12060,7 @@ def load_album_by_release_group(
         "https://musicbrainz.org/ws/2/release/"
         "?release-group=" +
         urllib.parse.quote(release_group_id) +
-        "&fmt=json&limit=1"
+        "&fmt=json&limit=10"
     )
 
     data = request(url)
@@ -11642,7 +12076,62 @@ def load_album_by_release_group(
             "No se encontró una edición del álbum."
         )
 
-    release = releases[0]
+    # --------------------------------------------------------
+    # Tipo real del álbum según MusicBrainz release-group.
+    # Permite distinguir álbum de estudio, directo,
+    # recopilatorio, etc. sin depender del título.
+    # --------------------------------------------------------
+    album_secondary_types = []
+
+    try:
+        group_url = (
+            "https://musicbrainz.org/ws/2/release-group/" +
+            urllib.parse.quote(release_group_id) +
+            "?fmt=json"
+        )
+
+        group_detail = request(group_url)
+
+        album_secondary_types = [
+            str(value).strip()
+            for value in group_detail.get(
+                "secondary-types",
+                []
+            )
+            if str(value).strip()
+        ]
+
+    except Exception as error:
+        # No impedimos cargar el álbum si MusicBrainz
+        # falla únicamente al consultar su clasificación.
+        print(
+            "ERROR MUSICBRAINZ ALBUM TYPE:",
+            repr(error),
+            flush=True
+        )
+        album_secondary_types = []
+
+    album_type = (
+        "live"
+        if any(
+            str(value).casefold() == "live"
+            for value in album_secondary_types
+        )
+        else "studio"
+    )
+
+    def prioridad_edicion(item):
+        estado = str(item.get("status", "")).lower()
+        titulo = str(item.get("title", "")).casefold().strip()
+        buscado = (album_title or "").casefold().strip()
+
+        return (
+            estado != "official",
+            bool(buscado) and titulo != buscado,
+            str(item.get("date") or "9999")
+        )
+
+    release = min(releases, key=prioridad_edicion)
 
     release_id = release.get("id")
 
@@ -11740,13 +12229,24 @@ def load_album_by_release_group(
                 "duration": duration
             })
 
-    return {
+    result = {
         "id": release_id,
         "release_group_id": release_group_id,
         "title": album_title,
         "artist": artist,
+        "album_type": album_type,
+        "secondary_types": album_secondary_types,
         "tracks": tracks
     }
+
+    if cache_key and tracks:
+        try:
+            cache_put("musicbrainz_album", cache_key, result)
+            print("MUSICBRAINZ ALBUM CACHE STORE:", cache_key, flush=True)
+        except Exception as error:
+            print("ERROR GUARDANDO CACHE:", repr(error), flush=True)
+
+    return result
 
 
 
@@ -11788,6 +12288,14 @@ def _spotify_pick(row, names):
     return ""
 
 
+
+# LASTFM_ARTISTAS_SIMILARES_V1
+import threading
+
+LASTFM_SIMILAR_CACHE = {}
+LASTFM_SIMILAR_LOCK = threading.Lock()
+LASTFM_SIMILAR_TTL = 24 * 60 * 60
+
 def spotify_parse_csv(content):
     content = content.lstrip("\ufeff")
 
@@ -11812,7 +12320,7 @@ def spotify_parse_csv(content):
         title = _spotify_pick(
             row,
             [
-                "Track Name",
+                "Track Name", "Nombre de la canción",
                 "Track",
                 "Song Name",
                 "Song",
@@ -11824,7 +12332,7 @@ def spotify_parse_csv(content):
         artist = _spotify_pick(
             row,
             [
-                "Artist Name(s)",
+                "Artist Name(s)", "Nombre(s) del artista",
                 "Artist Names",
                 "Artists",
                 "Artist",
@@ -11836,7 +12344,7 @@ def spotify_parse_csv(content):
         album = _spotify_pick(
             row,
             [
-                "Album Name",
+                "Album Name", "Nombre del álbum",
                 "Album",
                 "Record"
             ]
@@ -11845,7 +12353,7 @@ def spotify_parse_csv(content):
         uri = _spotify_pick(
             row,
             [
-                "Track URI",
+                "Track URI", "URI de la canción",
                 "Spotify URI",
                 "URI"
             ]
@@ -11854,7 +12362,7 @@ def spotify_parse_csv(content):
         duration = _spotify_pick(
             row,
             [
-                "Duration_ms",
+                "Duration_ms", "Duración de la canción (ms)",
                 "Duration (ms)",
                 "Duration ms",
                 "Duration",
@@ -12649,6 +13157,14 @@ def do_download_mobile(
                 command = [
 
                     "yt-dlp",
+                # DESCARGAS_REINTENTOS_YTDLP_V1
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "--extractor-retries", "3",
+                "--retry-sleep", "http:2",
+                "--retry-sleep", "fragment:2",
+                "--retry-sleep", "extractor:2",
+
 
                     "--js-runtimes",
                     "node",
@@ -12700,6 +13216,14 @@ def do_download_mobile(
                 command = [
 
                     "yt-dlp",
+                # DESCARGAS_REINTENTOS_YTDLP_V1
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "--extractor-retries", "3",
+                "--retry-sleep", "http:2",
+                "--retry-sleep", "fragment:2",
+                "--retry-sleep", "extractor:2",
+
 
                     "--js-runtimes",
                     "node",
@@ -13129,6 +13653,73 @@ def do_download_mobile(
 
             audio_file = audio_files[0]
 
+            # VALIDACION_AUDIO_MOVIL_V1
+            # Verificar el resultado antes de marcarlo como done.
+            if not audio_file.is_file():
+                raise RuntimeError(
+                    "El archivo descargado no existe."
+                )
+
+            if audio_file.stat().st_size <= 0:
+                raise RuntimeError(
+                    "El archivo de audio está vacío."
+                )
+
+            verify = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type:"
+                    "format=duration",
+                    "-of", "json",
+                    str(audio_file)
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if verify.returncode != 0:
+                raise RuntimeError(
+                    "Falló la verificación del audio: "
+                    + verify.stderr[-300:]
+                )
+
+            verify_data = json.loads(
+                verify.stdout or "{}"
+            )
+
+            valid_audio = any(
+                stream.get("codec_type") == "audio"
+                for stream in verify_data.get(
+                    "streams", []
+                )
+            )
+
+            try:
+                audio_duration = float(
+                    verify_data.get(
+                        "format", {}
+                    ).get("duration", 0)
+                )
+            except (TypeError, ValueError):
+                audio_duration = 0
+
+            if not valid_audio or audio_duration <= 0:
+                raise RuntimeError(
+                    "El archivo no contiene audio válido."
+                )
+
+            print(
+                "AUDIO MOVIL VERIFICADO:",
+                job,
+                format_name,
+                "duracion=", round(audio_duration, 2),
+                "bytes=", audio_file.stat().st_size,
+                flush=True
+            )
+
             downloads[job] = {
                 "status": "done",
                 "message": "Canción preparada para el móvil",
@@ -13217,6 +13808,718 @@ def do_download_mobile(
             clear_download_control(job)
 
 
+
+# ============================================================
+# BUSCADOR_PREDICTIVO_V2
+# Motor ligero de sugerencias, sin consultas externas
+# ============================================================
+
+import difflib as _smart_difflib
+import unicodedata as _smart_unicode
+import re as _smart_re
+
+SMART_ARTISTS = [
+    "Pink Floyd",
+    "Dire Straits",
+    "Metallica",
+    "Melendi",
+    "La Pantoja",
+    "Joaquín Sabina",
+    "Estopa",
+    "Queen",
+    "The Beatles",
+    "The Rolling Stones",
+    "AC/DC",
+    "Coldplay",
+    "U2",
+    "Radiohead",
+    "Nirvana",
+    "Linkin Park",
+    "Depeche Mode",
+    "David Bowie",
+    "Bruce Springsteen",
+    "Michael Jackson",
+    "Madonna",
+    "Shakira",
+    "Rosalía",
+    "Alejandro Sanz",
+    "Pablo Alborán",
+    "Manuel Carrasco",
+    "Fito y Fitipaldis",
+    "Extremoduro",
+    "Marea",
+    "El Barrio",
+    "Camela",
+    "Héroes del Silencio",
+    "Vetusta Morla",
+    "Leiva",
+    "Mecano",
+    "Hombres G",
+    "Los Secretos",
+    "El Canto del Loco",
+    "Maná",
+    "Soda Stereo",
+    "Luis Miguel",
+    "Julio Iglesias",
+    "Enrique Iglesias",
+    "Juanes",
+    "Bad Bunny",
+    "Karol G",
+    "Rauw Alejandro",
+    "Daddy Yankee",
+    "Ozuna",
+    "Feid",
+    "Myke Towers",
+    "Morat",
+    "Imagine Dragons",
+    "Arctic Monkeys",
+    "Red Hot Chili Peppers",
+    "Guns N' Roses",
+    "Bon Jovi",
+    "Aerosmith",
+    "Scorpions",
+    "Iron Maiden",
+    "Black Sabbath",
+    "Led Zeppelin",
+    "Deep Purple",
+    "The Doors",
+    "The Police",
+    "Sting",
+    "Phil Collins",
+    "Genesis",
+    "Eagles",
+    "Fleetwood Mac",
+    "Tina Turner",
+    "Whitney Houston",
+    "Celine Dion",
+    "Adele",
+    "Ed Sheeran",
+    "Taylor Swift",
+    "Billie Eilish",
+    "Dua Lipa",
+    "The Weeknd",
+    "Bruno Mars",
+    "Lady Gaga",
+    "Beyoncé",
+    "Rihanna",
+    "Eminem",
+    "Drake",
+    "Kendrick Lamar",
+    "Bob Marley",
+    "Eric Clapton",
+    "Mark Knopfler",
+    "John Lennon",
+    "Paul McCartney",
+    "Elton John",
+    "Billy Joel",
+    "Creedence Clearwater Revival",
+    "Supertramp",
+    "The Alan Parsons Project",
+    "Electric Light Orchestra",
+    "The Cure",
+    "R.E.M.",
+    "Oasis",
+    "Blur",
+    "Muse",
+    "Placebo"
+]
+
+
+def smart_normalize(value):
+    value = _smart_unicode.normalize(
+        "NFD",
+        str(value or "").casefold()
+    )
+
+    value = "".join(
+        character
+        for character in value
+        if _smart_unicode.category(character) != "Mn"
+    )
+
+    return _smart_re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value
+    ).strip()
+
+
+
+# CATALOGO_DINAMICO_SUGERENCIAS_V3
+import os as _smart_os
+import json as _smart_json
+import threading as _smart_threading
+
+SMART_CATALOG_FILE = (
+    "/opt/music-downloader/data/"
+    "smart_suggestions_v3.json"
+)
+
+SMART_CATALOG_LOCK = _smart_threading.Lock()
+SMART_CATALOG = {}
+
+
+def smart_catalog_load():
+    global SMART_CATALOG
+
+    try:
+        with open(
+            SMART_CATALOG_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = _smart_json.load(file)
+
+        if isinstance(data, dict):
+            SMART_CATALOG = data
+
+    except (OSError, ValueError):
+        SMART_CATALOG = {}
+
+
+
+# CATALOGO_MUSICAL_V7
+
+def smart_catalog_add(value, kind="artist", **metadata):
+    value = str(value or "").strip()
+
+    if not 2 <= len(value) <= 150:
+        return
+
+    key = smart_normalize(value)
+
+    if not key:
+        return
+
+    with SMART_CATALOG_LOCK:
+        previous = SMART_CATALOG.get(key)
+
+        if previous is None:
+            if len(SMART_CATALOG) >= 10000:
+                return
+
+            entry = {
+                "text": value,
+                "type": kind
+            }
+
+        else:
+            if not isinstance(previous, dict):
+                return
+
+            entry = dict(previous)
+
+            if kind == "mb_artist":
+                entry["type"] = "mb_artist"
+
+            elif kind == "album":
+                entry["type"] = "album"
+
+        allowed = (
+            "artist",
+            "mbid",
+            "date",
+            "album_type"
+        )
+
+        for field in allowed:
+            value_meta = metadata.get(field)
+
+            if value_meta is not None:
+                value_meta = str(value_meta).strip()
+
+                if value_meta:
+                    entry[field] = value_meta[:200]
+
+        if previous == entry:
+            return
+
+        SMART_CATALOG[key] = entry
+
+        try:
+            _smart_os.makedirs(
+                _smart_os.path.dirname(SMART_CATALOG_FILE),
+                exist_ok=True
+            )
+
+            temporary = SMART_CATALOG_FILE + ".tmp"
+
+            with open(
+                temporary,
+                "w",
+                encoding="utf-8"
+            ) as file:
+                _smart_json.dump(
+                    SMART_CATALOG,
+                    file,
+                    ensure_ascii=False
+                )
+
+            _smart_os.replace(
+                temporary,
+                SMART_CATALOG_FILE
+            )
+
+        except OSError as error:
+            print(
+                "SMART CATALOG ERROR:",
+                repr(error),
+                flush=True
+            )
+
+
+
+smart_catalog_load()
+
+
+
+
+# MOTOR_SUGERENCIAS_V5
+
+SMART_V5_NOISE = (
+    "cover", "karaoke", "tutorial", "lesson",
+    "reaction", "fingerstyle", "tribute",
+    "remix", "nightcore", "slowed", "reverb",
+    "drum", "guitar solo", "backing track",
+    "playlist", "playliste", "greatest hits",
+    "full album", "best songs", "translation",
+    "traduccion", "sub espanol", "lyrics",
+    "lyric video", "live", "directo",
+    "en vivo", "vinyl", "extended",
+)
+
+SMART_V5_TAGS = (
+    "official music video",
+    "official video",
+    "official audio",
+    "official lyric video",
+    "remastered hd",
+    "remastered",
+    "hq",
+    "hd",
+    "4k",
+    "video oficial",
+    "audio oficial",
+)
+
+
+def smart_v5_clean(value):
+    import re
+
+    value = " ".join(str(value or "").split())
+
+    for tag in SMART_V5_TAGS:
+        value = re.sub(
+            r"\s*[\(\[]\s*" +
+            re.escape(tag) +
+            r"\s*[\)\]]",
+            "",
+            value,
+            flags=re.IGNORECASE
+        )
+
+    return value.strip(" -|")
+
+
+
+def smart_v5_quality(text):
+    import re
+
+    normalized = smart_normalize(text)
+    penalty = 0
+
+    for noise in SMART_V5_NOISE:
+        pattern = r"(?<![a-z0-9])" + re.escape(noise) + r"(?![a-z0-9])"
+
+        if re.search(pattern, normalized):
+            penalty += 28
+            break
+
+    if len(text) > 85:
+        penalty += 15
+
+    return penalty
+
+
+
+# MOTOR_SUGERENCIAS_V8
+
+
+# MOTOR_SUGERENCIAS_V9
+
+def smart_suggest(query, limit=50):
+    import re
+
+    query = smart_normalize(query)
+
+    if len(query) < 2:
+        return []
+
+    entries = [
+        {
+            "text": name,
+            "type": "artist",
+            "artist": "",
+            "date": ""
+        }
+        for name in SMART_ARTISTS
+    ]
+
+    with SMART_CATALOG_LOCK:
+        saved = list(SMART_CATALOG.values())
+
+    for entry in saved:
+        if not isinstance(entry, dict):
+            continue
+
+        kind = entry.get("type", "song")
+
+        if kind == "artist":
+            continue
+
+        entries.append({
+            "text": entry.get("text", ""),
+            "type": "artist" if kind == "mb_artist" else kind,
+            "artist": entry.get("artist", ""),
+            "date": entry.get("date", "")
+        })
+
+    ranked = {}
+
+    for entry in entries:
+        title = smart_v5_clean(entry["text"])
+        candidate = smart_normalize(title)
+        artist = smart_normalize(entry.get("artist", ""))
+        kind = entry["type"]
+
+        if not candidate:
+            continue
+
+        direct = False
+        artist_match = False
+
+        if candidate == query:
+            score = 170
+            direct = True
+
+        elif candidate.startswith(query):
+            score = 145
+            direct = True
+
+        elif query in candidate:
+            score = 125
+            direct = True
+
+        elif artist and (
+            artist == query
+            or artist.startswith(query)
+        ):
+            score = 95
+            artist_match = True
+
+        else:
+            words = candidate.split()
+
+            similarity = max(
+                [
+                    _smart_difflib.SequenceMatcher(
+                        None, query, word
+                    ).ratio()
+                    for word in words
+                ] + [
+                    _smart_difflib.SequenceMatcher(
+                        None, query, candidate
+                    ).ratio()
+                ]
+            )
+
+            score = int(similarity * 100)
+
+        if score < 65:
+            continue
+
+        score -= smart_v5_quality(title)
+
+        if kind == "artist":
+            score += 40
+
+        elif kind == "album":
+            score += 10
+
+            if artist_match:
+                score -= 10
+
+        elif kind == "song":
+            score += 5
+
+        # Penalizar ediciones alternativas.
+        alternatives = (
+            "restored", "demo", "demos",
+            "bootleg", "remaster", "remastered",
+            "deluxe", "expanded", "anniversary",
+            "live", "directo", "compilation",
+            "collection", "greatest hits"
+        )
+
+        for word in alternatives:
+            pattern = (
+                r"(?<![a-z0-9])"
+                + re.escape(word)
+                + r"(?![a-z0-9])"
+            )
+
+            if re.search(pattern, candidate):
+                score -= 25
+                break
+
+        if artist_match:
+            # Los títulos genéricos no deben desplazar
+            # coincidencias directas de la búsqueda.
+            if len(candidate.split()) == 1:
+                score -= 8
+
+        if not direct and not artist_match:
+            extra = max(
+                0,
+                len(candidate.split()) - len(query.split())
+            )
+            score -= min(extra * 2, 16)
+
+        if score < 60:
+            continue
+
+        key = candidate
+
+        item = {
+            "text": title,
+            "type": kind,
+            "score": max(0, min(100, score))
+        }
+
+        previous = ranked.get(key)
+
+        if previous is None or score > previous[0]:
+            ranked[key] = (score, item)
+
+    results = sorted(
+        ranked.values(),
+        key=lambda value: (
+            -value[0],
+            len(value[1]["text"]),
+            value[1]["text"].casefold()
+        )
+    )
+
+    return [
+        item
+        for _, item in results[:limit]
+    ]
+
+
+
+
+import threading as audio_threading
+import time as audio_time
+
+_AUDIO_URL_CACHE = {}
+_AUDIO_URL_LOCK = audio_threading.Lock()
+_AUDIO_CACHE_TTL = 120
+_AUDIO_CHUNK_SIZE = 524288
+
+
+def _audio_get_url(video_id, refresh=False):
+    now = audio_time.monotonic()
+
+    with _AUDIO_URL_LOCK:
+        cached = _AUDIO_URL_CACHE.get(video_id)
+
+        if (
+            not refresh
+            and cached
+            and now - cached[1] < _AUDIO_CACHE_TTL
+        ):
+            return cached[0]
+
+    url = get_preview_url(video_id)
+
+    with _AUDIO_URL_LOCK:
+        _AUDIO_URL_CACHE[video_id] = (
+            url,
+            audio_time.monotonic()
+        )
+
+    return url
+
+
+def _audio_fetch_range(video_id, start, end, url=None):
+    last_error = None
+
+    for attempt in range(3):
+        if attempt == 0 and url:
+            current_url = url
+        else:
+            current_url = _audio_get_url(
+                video_id,
+                refresh=(attempt > 0)
+            )
+
+        request = urllib.request.Request(
+            current_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Range": f"bytes={start}-{end}"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30
+            ) as response:
+
+                if response.status != 206:
+                    raise RuntimeError(
+                        f"Respuesta inesperada: {response.status}"
+                    )
+
+                content_range = response.headers.get(
+                    "Content-Range", ""
+                )
+
+                expected_prefix = f"bytes {start}-{end}/"
+
+                if not content_range.startswith(expected_prefix):
+                    raise RuntimeError(
+                        "Content-Range inesperado: " + content_range
+                    )
+
+                total = int(content_range.split("/")[-1])
+                data = response.read()
+
+                if len(data) != end - start + 1:
+                    raise RuntimeError(
+                        "Fragmento incompleto"
+                    )
+
+                return data, total, current_url
+
+        except urllib.error.HTTPError as error:
+            last_error = error
+
+            if error.code not in (403, 429, 500, 502, 503):
+                raise
+
+            print(
+                f"AUDIO: HTTP {error.code}, intento {attempt + 1}",
+                flush=True
+            )
+
+        except (OSError, RuntimeError) as error:
+            last_error = error
+
+            print(
+                f"AUDIO: reintento {attempt + 1}: {error}",
+                flush=True
+            )
+
+    raise RuntimeError(
+        f"No se pudo recuperar el fragmento: {last_error}"
+    )
+
+
+# BUSCADOR_INTELIGENTE_V2
+def rank_music_search(query, results):
+    import re
+    import unicodedata
+
+    def norm(value):
+        value = unicodedata.normalize(
+            "NFD", str(value or "").casefold()
+        )
+        value = "".join(
+            c for c in value
+            if unicodedata.category(c) != "Mn"
+        )
+        return " ".join(re.findall(r"[a-z0-9]+", value))
+
+    artist = norm(query)
+
+    if not artist or not isinstance(results, list):
+        return results
+
+    def contains(text, phrase):
+        return (" " + phrase + " ") in (" " + text + " ")
+
+    def score(item):
+        if not isinstance(item, dict):
+            return 0
+
+        title = norm(item.get("title"))
+        channel = norm(item.get("channel"))
+
+        points = 0
+
+        if channel == artist:
+            points += 120
+
+        elif channel in (
+            artist + " oficial",
+            artist + " official",
+            artist + " topic"
+        ):
+            points += 120
+
+        elif contains(channel, artist):
+            points += 25
+
+        if contains(title, artist):
+            points += 20
+
+        if any(contains(title, term) for term in (
+            "audio oficial",
+            "official audio",
+            "video oficial",
+            "official video"
+        )):
+            points += 8
+
+        if any(contains(title, term) for term in (
+            "cover",
+            "karaoke",
+            "tributo",
+            "tribute",
+            "remix",
+            "reaction",
+            "tutorial",
+            "nightcore",
+            "sped up",
+            "slowed"
+        )):
+            points -= 90
+
+        if any(contains(title, term) for term in (
+            "lyrics",
+            "letra",
+            "lyric video"
+        )):
+            points -= 20
+
+        if any(contains(title, term) for term in (
+            "full album",
+            "album completo",
+            "mix completo",
+            "playlist completa",
+            "concierto completo",
+            "greatest hits",
+            "grandes exitos"
+        )):
+            points -= 65
+
+        return points
+
+    return sorted(results, key=score, reverse=True)
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, data, status=200):
@@ -13276,6 +14579,375 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
+
+        # LASTFM_ARTISTAS_SIMILARES_V1
+        if parsed.path == "/api/artists/similar":
+
+            params = urllib.parse.parse_qs(parsed.query)
+            artist = params.get("artist", [""])[0].strip()
+
+            if not artist or len(artist) > 120:
+                self.send_json({
+                    "error": "Nombre de artista no válido."
+                }, 400)
+                return
+
+            key = os.environ.get(
+                "LASTFM_API_KEY", ""
+            ).strip()
+
+            if not key:
+                self.send_json({
+                    "error": "Last.fm no está configurado."
+                }, 503)
+                return
+
+            cache_key = artist.casefold()
+            now = time.time()
+
+            with LASTFM_SIMILAR_LOCK:
+                cached = LASTFM_SIMILAR_CACHE.get(cache_key)
+
+            if cached and now - cached["time"] < LASTFM_SIMILAR_TTL:
+                self.send_json({
+                    "artist": artist,
+                    "count": len(cached["artists"]),
+                    "artists": cached["artists"],
+                    "cached": True
+                })
+                return
+
+            try:
+                query = urllib.parse.urlencode({
+                    "method": "artist.getsimilar",
+                    "artist": artist,
+                    "api_key": key,
+                    "format": "json",
+                    "autocorrect": "1",
+                    "limit": "8"
+                })
+
+                url = (
+                    "https://ws.audioscrobbler.com/2.0/?"
+                    + query
+                )
+
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "MusicDownloader/1.0"
+                    }
+                )
+
+                with urllib.request.urlopen(
+                    request, timeout=10
+                ) as response:
+                    data = json.load(response)
+
+                if "error" in data:
+                    raise ValueError(
+                        "Last.fm rechazó la consulta."
+                    )
+
+                results = data.get(
+                    "similarartists", {}
+                ).get("artist", [])
+
+                if isinstance(results, dict):
+                    results = [results]
+
+                artists = []
+                seen = {artist.casefold()}
+
+                for entry in results:
+                    name = str(
+                        entry.get("name", "")
+                    ).strip()
+
+                    if not name or name.casefold() in seen:
+                        continue
+
+                    seen.add(name.casefold())
+
+                    artists.append({
+                        "name": name,
+                        "match": entry.get("match", "0")
+                    })
+
+                    if len(artists) >= 8:
+                        break
+
+                # LASTFM_FOTOS_ARTISTAS_V1
+                # Fotografías de TheAudioDB, sin alterar Last.fm.
+                import concurrent.futures
+
+                # FOTOS_ARTISTAS_VARIANTES_V1
+                # Normalización exclusiva para encontrar fotografías.
+                # No cambia los nombres que devuelve Last.fm.
+
+                import re
+                import unicodedata
+
+                def normalize_artist_name(value):
+                    value = unicodedata.normalize(
+                        "NFKD", str(value or "")
+                    )
+
+                    value = "".join(
+                        c for c in value
+                        if not unicodedata.combining(c)
+                    ).casefold()
+
+                    value = value.replace("&", " y ")
+
+                    value = re.sub(
+                        r"[^a-z0-9]+", " ", value
+                    )
+
+                    return " ".join(value.split())
+
+                def artist_photo_variants(name):
+                    variants = [name]
+
+                    # Conectores equivalentes.
+                    alternative = re.sub(
+                        r"\s+y\s+",
+                        " & ",
+                        name,
+                        flags=re.IGNORECASE
+                    )
+
+                    if alternative != name:
+                        variants.append(alternative)
+
+                    if "&" in name:
+                        variants.append(
+                            name.replace("&", " y ")
+                        )
+
+                    # Eliminar tildes para una segunda consulta.
+                    plain = "".join(
+                        c for c in unicodedata.normalize(
+                            "NFKD", name
+                        )
+                        if not unicodedata.combining(c)
+                    )
+
+                    variants.append(plain)
+
+                    # Evitar peticiones duplicadas.
+                    return list(dict.fromkeys(
+                        v.strip() for v in variants
+                        if v and v.strip()
+                    ))
+
+                def fetch_artist_photo(entry):
+                    name = entry["name"]
+                    normalized_name = normalize_artist_name(name)
+
+                    for candidate in artist_photo_variants(name):
+                        try:
+                            photo_url = (
+                                "https://www.theaudiodb.com/"
+                                "api/v1/json/123/search.php?"
+                                + urllib.parse.urlencode(
+                                    {"s": candidate}
+                                )
+                            )
+
+                            request = urllib.request.Request(
+                                photo_url,
+                                headers={
+                                    "User-Agent":
+                                        "MusicDownloader/1.0"
+                                }
+                            )
+
+                            with urllib.request.urlopen(
+                                request, timeout=5
+                            ) as response:
+                                data_photo = json.load(response)
+
+                            matches = (
+                                data_photo.get("artists") or []
+                            )
+
+                            artist_data = next(
+                                (
+                                    a for a in matches
+                                    if normalize_artist_name(
+                                        a.get("strArtist", "")
+                                    ) == normalized_name
+                                ),
+                                None
+                            )
+
+                            if not artist_data:
+                                continue
+
+                            image = (
+                                artist_data.get("strArtistThumb")
+                                or artist_data.get("strArtistWideThumb")
+                                or ""
+                            )
+
+                            if not isinstance(image, str):
+                                continue
+
+                            image = image.strip()
+
+                            if image.startswith("http://r2.theaudiodb.com/"):
+                                image = (
+                                    "https://" +
+                                    image[len("http://"):]
+                                )
+
+                            if image.startswith("https://"):
+                                entry["image"] = image
+                                break
+
+                        except Exception:
+                            continue
+
+                    # FOTOS_ARTISTAS_DEEZER_FALLBACK_V1
+                    # Solo consultar Deezer si TheAudioDB no tiene foto.
+                    if not entry.get("image"):
+                        try:
+                            # FOTOS_DEEZER_ALIAS_VALIDACION_V2
+                            # Alias verificado del dúo.
+                            verified_aliases = {
+                                "kiko y sara": ("Kiko y Shara", 8470194),
+                                "kiko y shara": ("Kiko y Shara", 8470194)
+                            }
+
+                            alias = verified_aliases.get(normalized_name)
+                            search_name = alias[0] if alias else name
+                            expected_name = normalize_artist_name(search_name)
+
+                            deezer_url = (
+                                "https://api.deezer.com/search/artist?"
+                                + urllib.parse.urlencode({
+                                    "q": search_name,
+                                    "limit": 20
+                                })
+                            )
+
+                            deezer_req = urllib.request.Request(
+                                deezer_url,
+                                headers={
+                                    "User-Agent": "MusicDownloader/1.0"
+                                }
+                            )
+
+                            with urllib.request.urlopen(
+                                deezer_req, timeout=5
+                            ) as response:
+                                deezer_data = json.load(response)
+
+                            deezer_matches = [
+                                item
+                                for item in (deezer_data.get("data") or [])
+                                if normalize_artist_name(
+                                    item.get("name", "")
+                                ) == expected_name
+                            ]
+
+                            # Identidades conocidas verificadas
+                            # mediante la búsqueda de artistas.
+                            known_ids = {
+                                "tijeritas": 114083,
+                                "queco": 71962,
+                                "junco": 152192,
+                                "nolasco": 57372,
+                                "gabriel moreno": 1376344
+                            }
+
+                            known_id = (
+                                alias[1] if alias
+                                else known_ids.get(normalized_name)
+                            )
+
+                            if known_id:
+                                deezer_matches = [
+                                    item for item in deezer_matches
+                                    if item.get("id") == known_id
+                                ]
+
+                            # Evitar nombres ambiguos.
+                            if len(deezer_matches) == 1:
+                                deezer_artist = deezer_matches[0]
+
+                                image = str(
+                                    deezer_artist.get("picture_medium")
+                                    or deezer_artist.get("picture_big")
+                                    or ""
+                                ).strip()
+
+                                parsed_image = urllib.parse.urlparse(image)
+
+                                if (
+                                    parsed_image.scheme == "https"
+                                    and parsed_image.hostname
+                                    == "cdn-images.dzcdn.net"
+                                    and "/images/artist//" not in image
+                                    and "/images/artist/" in image
+                                ):
+                                    entry["image"] = image
+
+                        except Exception as error:
+                            print(
+                                "DEEZER PHOTO ERROR:",
+                                type(error).__name__,
+                                flush=True
+                            )
+
+                    return entry
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4
+                ) as photo_pool:
+                    artists = list(
+                        photo_pool.map(fetch_artist_photo, artists)
+                    )
+
+                with LASTFM_SIMILAR_LOCK:
+                    LASTFM_SIMILAR_CACHE[cache_key] = {
+                        "time": time.time(),
+                        "artists": artists
+                    }
+
+                self.send_json({
+                    "artist": artist,
+                    "count": len(artists),
+                    "artists": artists,
+                    "cached": False
+                })
+
+            except Exception as error:
+                print(
+                    "LASTFM SIMILAR ERROR:",
+                    type(error).__name__,
+                    flush=True
+                )
+
+                # Mantener recomendaciones antiguas si existen.
+                with LASTFM_SIMILAR_LOCK:
+                    stale = LASTFM_SIMILAR_CACHE.get(cache_key)
+
+                artists = (
+                    stale["artists"] if stale else []
+                )
+
+                self.send_json({
+                    "artist": artist,
+                    "count": len(artists),
+                    "artists": artists,
+                    "cached": bool(stale),
+                    "unavailable": True
+                })
+
+            return
+
         if parsed.path == "/api/album-track":
 
             params = urllib.parse.parse_qs(
@@ -13286,6 +14958,20 @@ class Handler(BaseHTTPRequestHandler):
                 "q",
                 [""]
             )[0].strip()
+
+            album_title = params.get(
+                "album",
+                [""]
+            )[0].strip()
+
+            album_type = params.get(
+                "album_type",
+                [""]
+            )[0].strip().casefold()
+
+            is_live_album = (
+                album_type == "live"
+            )
 
             if not query:
                 self.send_json(
@@ -13298,7 +14984,76 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                results = search_youtube(query, 5)
+                search_query = query
+                search_limit = 5
+
+                if is_live_album:
+
+                    search_query = " ".join(
+                        part
+                        for part in (
+                            query,
+                            album_title,
+                            "live",
+                            "directo"
+                        )
+                        if part
+                    )
+
+                    search_limit = 10
+
+                print(
+                    "ALBUM TRACK SEARCH:",
+                    "type=",
+                    album_type or "studio",
+                    "album=",
+                    album_title,
+                    "query=",
+                    search_query,
+                    flush=True
+                )
+
+                results = search_youtube(
+                    search_query,
+                    search_limit
+                )
+
+                # Búsquedas alternativas solo si no hay resultados.
+                if not results:
+
+                    import re
+
+                    partes = re.split(
+                        r"\s+-\s+",
+                        query,
+                        maxsplit=1
+                    )
+
+                    if len(partes) == 2:
+
+                        artista = partes[0].strip()
+                        titulo = partes[1].strip()
+
+                        alternativas = [
+                            f"{titulo} {artista}",
+                            f"{artista} {titulo} canción"
+                        ]
+
+                        for alternativa in alternativas:
+
+                            results = search_youtube(
+                                alternativa,
+                                5
+                            )
+
+                            if results:
+                                print(
+                                    "ALBUM TRACK FALLBACK:",
+                                    alternativa,
+                                    flush=True
+                                )
+                                break
+
 
                 if not results:
                     self.send_json(
@@ -13394,12 +15149,25 @@ class Handler(BaseHTTPRequestHandler):
                     ):
                         score += 40
 
-                    # Canal coincide con el artista.
-                    if (
-                        wanted_artist
-                        and wanted_artist in candidate_channel
-                    ):
-                        score += 50
+                    # Priorizar fuertemente el canal oficial
+                    # del propio artista.
+                    if wanted_artist:
+
+                        if (
+                            wanted_artist in candidate_channel
+                            and (
+                                "oficial" in candidate_channel
+                                or "official" in candidate_channel
+                                or "topic" in candidate_channel
+                            )
+                        ):
+                            score += 220
+
+                        elif candidate_channel == wanted_artist:
+                            score += 100
+
+                        elif wanted_artist in candidate_channel:
+                            score += 50
 
                     # Título completo.
                     if (
@@ -13439,6 +15207,61 @@ class Handler(BaseHTTPRequestHandler):
                         if word in candidate_title:
                             score += points
 
+                    if is_live_album:
+
+                        normalized_album = normalize_album_result(
+                            album_title
+                        )
+
+                        # Coincidencia completa con el nombre del
+                        # álbum Live: máxima prioridad.
+                        if (
+                            normalized_album
+                            and normalized_album in candidate_title
+                        ):
+                            score += 350
+
+                        elif normalized_album:
+
+                            album_words = [
+                                word
+                                for word in normalized_album.split()
+                                if len(word) >= 4
+                            ]
+
+                            for word in album_words:
+
+                                if word in candidate_title:
+                                    score += 18
+
+                        if "live" in candidate_title:
+                            score += 140
+
+                        if "directo" in candidate_title:
+                            score += 140
+
+                        # Un concierto puede ser válido, pero una
+                        # coincidencia con el álbum tiene prioridad.
+                        if "gira" in candidate_title:
+                            score -= 35
+
+                        if "concierto" in candidate_title:
+                            score -= 35
+
+                    else:
+
+                        # Para álbumes normales seguimos evitando
+                        # versiones Live.
+                        for word in (
+                            "directo",
+                            "live",
+                            "gira",
+                            "concierto"
+                        ):
+
+                            if word in candidate_title:
+                                score -= 120
+
                     # Solo desempate por posición.
                     # NO premiamos Official Audio/Video,
                     # para no cambiar versiones válidas.
@@ -13463,7 +15286,298 @@ class Handler(BaseHTTPRequestHandler):
                     reverse=True
                 )
 
+                # ALBUM_LIVE_SELECTOR_V4
+                # Canción correcta y concierto correcto.
+                # Exclusivamente para álbumes Live.
                 result = scored_results[0][2]
+
+                if is_live_album:
+
+                    import re
+
+                    wanted_tokens = [
+                        w for w in wanted_title.split()
+                        if len(w) >= 3
+                        and w not in {
+                            "the", "and", "for", "you",
+                            "los", "las", "del", "con",
+                            "una", "por", "para", "que",
+                            "en", "mas"
+                        }
+                    ]
+
+                    wanted_compact = "".join(
+                        wanted_title.split()[:4]
+                    )
+
+                    album_normalized = normalize_album_result(
+                        album_title
+                    )
+
+                    album_compact = album_normalized.replace(
+                        " ", ""
+                    )
+
+                    # Buscar alternativas incluso cuando la
+                    # búsqueda inicial ha encontrado resultados.
+                    parts = re.split(
+                        r"\\s+-\\s+", query, maxsplit=1
+                    )
+
+                    if len(parts) == 2:
+                        artist_part, song_part = parts
+                    else:
+                        artist_part = wanted_artist
+                        song_part = query
+
+                    extra_queries = [
+                        f"{artist_part} {song_part} {album_title}",
+                        f"{artist_part} {song_part} live {album_title}"
+                    ]
+
+                    candidates = []
+                    seen_ids = set()
+
+                    def add_candidate(candidate):
+                        if not isinstance(candidate, dict):
+                            return
+
+                        video_id = str(
+                            candidate.get("id", "")
+                        ).strip()
+
+                        if not video_id or video_id in seen_ids:
+                            return
+
+                        seen_ids.add(video_id)
+                        candidates.append(candidate)
+
+                    for candidate in results:
+                        add_candidate(candidate)
+
+                    def candidate_rank(candidate):
+                        title = normalize_album_result(
+                            candidate.get("title", "")
+                        )
+                        channel = normalize_album_result(
+                            candidate.get("channel", "")
+                        )
+
+                        words = set(title.split())
+
+                        matched = sum(
+                            1 for word in set(wanted_tokens)
+                            if word in words
+                        )
+
+                        compact_title = title.replace(
+                            " ", ""
+                        )
+
+                        compact_match = bool(
+                            len(wanted_compact) >= 6
+                            and wanted_compact in compact_title
+                        )
+
+                        needed = max(
+                            1,
+                            (len(set(wanted_tokens)) + 1) // 2
+                        )
+
+                        if (
+                            matched < needed
+                            and not compact_match
+                            and wanted_title not in title
+                        ):
+                            return None
+
+                        # Evitar vídeos de reacción y versiones
+                        # que no son la interpretación buscada.
+                        excluded = (
+                            "reaction", "reacts", "reaccion",
+                            "reaccionan", "cover", "karaoke",
+                            "tutorial", "backing track",
+                            "drumless", "guitar lesson",
+                            "bass tab", "remix", "nightcore"
+                        )
+
+                        if any(x in title for x in excluded):
+                            return None
+
+                        score = matched * 35
+
+                        if wanted_title in title:
+                            score += 100
+
+                        if compact_match:
+                            score += 90
+
+                        if (
+                            wanted_artist
+                            and wanted_artist in title
+                        ):
+                            score += 25
+
+                        if (
+                            wanted_artist
+                            and wanted_artist in channel
+                        ):
+                            score += 35
+
+                        if (
+                            "oficial" in channel
+                            or "official" in channel
+                        ):
+                            score += 30
+
+                        if (
+                            "live" in words
+                            or "directo" in words
+                            or "concert" in words
+                        ):
+                            score += 55
+
+                        # El nombre completo del álbum debe
+                        # coincidir respetando límites de palabra.
+                        album_match = False
+
+                        if album_normalized:
+                            pattern = (
+                                r"(?:^|\\s)"
+                                + re.escape(album_normalized)
+                                + r"(?:$|\\s)"
+                            )
+                            album_match = bool(
+                                re.search(pattern, title)
+                            )
+
+                        # Admite PULSE / P.U.L.S.E.
+                        if (
+                            not album_match
+                            and len(album_compact) >= 5
+                            and album_compact in compact_title
+                        ):
+                            album_match = True
+
+                        if album_match:
+                            score += 260
+
+                        # Distinguir conciertos diferentes.
+                        if album_compact == "sm":
+                            if "s m2" in title or "sm2" in compact_title:
+                                score -= 500
+                            if "sfso" in title:
+                                score += 110
+                            if "1999" in title:
+                                score += 90
+
+                        if "wembley" in album_normalized:
+                            if "wembley" in title:
+                                score += 160
+                            if "1986" in title or "86" in words:
+                                score += 60
+                            if "live aid" in title:
+                                score -= 500
+                            if "montreal" in title:
+                                score -= 450
+
+                        if album_compact == "pulse":
+                            if "1994" in title or "1995" in title:
+                                score += 65
+                            if (
+                                "1990" in title
+                                or "1974" in title
+                            ):
+                                score -= 350
+
+                        return score
+
+                    # ALBUM_LIVE_BUSQUEDA_OPTIMIZADA_V5
+                    # Solo buscar más cuando los candidatos
+                    # actuales no ofrecen confianza suficiente.
+
+                    def best_candidate_score():
+                        scores = [
+                            candidate_rank(candidate)
+                            for candidate in candidates
+                        ]
+                        scores = [
+                            value for value in scores
+                            if value is not None
+                        ]
+                        return max(scores) if scores else -9999
+
+                    confidence_threshold = 430
+                    extra_searches = 0
+
+                    if best_candidate_score() < confidence_threshold:
+
+                        for extra_query in extra_queries:
+                            try:
+                                more = search_youtube(
+                                    extra_query, 12
+                                )
+
+                                extra_searches += 1
+
+                                for candidate in more:
+                                    add_candidate(candidate)
+
+                                if (
+                                    best_candidate_score()
+                                    >= confidence_threshold
+                                ):
+                                    break
+
+                            except Exception as search_error:
+                                print(
+                                    "ALBUM LIVE FALLBACK ERROR:",
+                                    repr(search_error),
+                                    flush=True
+                                )
+
+                    print(
+                        "ALBUM LIVE V5:",
+                        "extra_searches=", extra_searches,
+                        "best_score=", best_candidate_score(),
+                        flush=True
+                    )
+
+                    ranked = []
+
+                    for candidate in candidates:
+                        score = candidate_rank(candidate)
+
+                        if score is not None:
+                            ranked.append(
+                                (score, candidate)
+                            )
+
+                    if not ranked:
+                        self.send_json({
+                            "error":
+                                "No se encontró una versión "
+                                "válida de la canción."
+                        }, 404)
+                        return
+
+                    ranked.sort(
+                        key=lambda item: item[0],
+                        reverse=True
+                    )
+
+                    result = ranked[0][1]
+
+                    print(
+                        "ALBUM LIVE V4:",
+                        "album=", album_title,
+                        "song=", wanted_title,
+                        "selected=", result.get("title"),
+                        "id=", result.get("id"),
+                        "candidates=", len(candidates),
+                        flush=True
+                    )
+
 
                 self.send_json(
                     {
@@ -13644,6 +15758,22 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
+
+        if parsed.path == "/api/suggest":
+            params = urllib.parse.parse_qs(parsed.query)
+
+            query = params.get("q", [""])[0].strip()[:100]
+
+            if not query:
+                self.send_json({"suggestions": []})
+                return
+
+            self.send_json({
+                "query": query,
+                "suggestions": smart_suggest(query)
+            })
+            return
+
         if parsed.path == "/api/search":
 
             params = urllib.parse.parse_qs(
@@ -13669,7 +15799,26 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                results = search_youtube(query)
+                # BUSQUEDA_PROGRESIVA_SERVIDOR_V1
+                # Compatibilidad: sin limit se conservan los 100.
+                try:
+                    requested_limit = int(
+                        params.get("limit", ["100"])[0]
+                    )
+                except (ValueError, TypeError):
+                    requested_limit = 100
+
+                requested_limit = max(
+                    1, min(100, requested_limit)
+                )
+
+                results = search_youtube(
+                    query, limit=requested_limit
+                )
+
+                results = rank_music_search(
+                    query, results
+                )
 
                 self.send_json(
                     {
@@ -13685,6 +15834,239 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     500
                 )
+
+            return
+
+
+
+        # SPOTIFY AUDIO WARM - preparar URL sin transmitir audio.
+        if parsed.path == "/api/audio-warm":
+            params = urllib.parse.parse_qs(parsed.query)
+            video_id = params.get("id", [""])[0].strip()
+
+            if len(video_id) != 11 or not all(
+                c.isascii() and (c.isalnum() or c in "_-")
+                for c in video_id
+            ):
+                self.send_json({"error": "ID no válido"}, 400)
+                return
+
+            try:
+                _audio_get_url(video_id)
+
+                self.send_json({
+                    "status": "ready",
+                    "id": video_id
+                })
+
+            except Exception as error:
+                print(
+                    "SPOTIFY WARM ERROR:",
+                    repr(error),
+                    flush=True
+                )
+
+                self.send_json({
+                    "error": "No se pudo preparar el audio"
+                }, 502)
+
+            return
+
+        if parsed.path == "/api/audio":
+            params = urllib.parse.parse_qs(parsed.query)
+            video_id = params.get("id", [""])[0].strip()
+
+            if len(video_id) != 11 or not all(
+                c.isascii() and (c.isalnum() or c in "_-")
+                for c in video_id
+            ):
+                self.send_json({"error": "ID no válido"}, 400)
+                return
+
+            range_header = self.headers.get("Range", "")
+            range_start = 0
+            range_end = None
+            has_range = bool(range_header)
+
+            if has_range:
+                try:
+                    if not range_header.startswith("bytes="):
+                        raise ValueError()
+
+                    value = range_header[6:]
+
+                    if value.count("-") != 1:
+                        raise ValueError()
+
+                    first, last = value.split("-")
+
+                    if not first or not first.isdigit():
+                        raise ValueError()
+
+                    range_start = int(first)
+
+                    if last:
+                        if not last.isdigit():
+                            raise ValueError()
+                        range_end = int(last)
+
+                    if (
+                        range_end is not None
+                        and range_end < range_start
+                    ):
+                        raise ValueError()
+
+                except ValueError:
+                    self.send_json(
+                        {"error": "Range no válido"},
+                        400
+                    )
+                    return
+
+            headers_sent = False
+
+            try:
+                audio_url = _audio_get_url(video_id)
+
+                first_end = range_start + _AUDIO_CHUNK_SIZE - 1
+
+                if range_end is not None:
+                    first_end = min(first_end, range_end)
+
+                first_data = None
+                total = None
+
+                # AUDIO_INICIO_RAPIDO_V1
+                # Para reproducción desde el comienzo, intentar
+                # obtener tamaño y audio en una sola petición.
+                fast_ready = False
+
+                if range_start == 0 and range_end is None:
+                    try:
+                        first_data, total, audio_url = _audio_fetch_range(
+                            video_id,
+                            0,
+                            first_end,
+                            audio_url
+                        )
+                        fast_ready = True
+
+                    except Exception as fast_error:
+                        print(
+                            "AUDIO FAST FALLBACK:",
+                            type(fast_error).__name__,
+                            flush=True
+                        )
+
+                if fast_ready:
+                    final_end = total - 1
+
+                else:
+                    # Procedimiento original para rangos,
+                    # audios cortos o peticiones incompatibles.
+                    probe, probe_total, audio_url = _audio_fetch_range(
+                        video_id,
+                        0,
+                        0,
+                        audio_url
+                    )
+
+                    total = probe_total
+
+                    if range_start >= total:
+                        self.send_response(416)
+                        self.send_header(
+                            "Content-Range",
+                            f"bytes */{total}"
+                        )
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+
+                    final_end = (
+                        min(range_end, total - 1)
+                        if range_end is not None
+                        else total - 1
+                    )
+
+                    first_end = min(first_end, final_end)
+
+                    first_data, checked_total, audio_url = _audio_fetch_range(
+                        video_id,
+                        range_start,
+                        first_end,
+                        audio_url
+                    )
+
+                    if checked_total != total:
+                        raise RuntimeError(
+                            "El tamaño del audio ha cambiado"
+                        )
+
+                length = final_end - range_start + 1
+
+                self.send_response(206 if has_range else 200)
+                self.send_header("Content-Type", "audio/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+
+                if has_range:
+                    self.send_header(
+                        "Content-Range",
+                        f"bytes {range_start}-{final_end}/{total}"
+                    )
+
+                self.send_header(
+                    "Access-Control-Allow-Origin", "*"
+                )
+                self.end_headers()
+                headers_sent = True
+
+                self.wfile.write(first_data)
+
+                position = first_end + 1
+
+                while position <= final_end:
+                    block_end = min(
+                        position + _AUDIO_CHUNK_SIZE - 1,
+                        final_end
+                    )
+
+                    data, new_total, audio_url = _audio_fetch_range(
+                        video_id,
+                        position,
+                        block_end,
+                        audio_url
+                    )
+
+                    if new_total != total:
+                        raise RuntimeError(
+                            "El tamaño del audio ha cambiado"
+                        )
+
+                    self.wfile.write(data)
+                    position = block_end + 1
+
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+            except Exception as error:
+                print(
+                    "ERROR /api/audio:",
+                    repr(error),
+                    flush=True
+                )
+
+                if not headers_sent:
+                    try:
+                        self.send_json(
+                            {"error": "Error transmitiendo audio"},
+                            502
+                        )
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                else:
+                    self.close_connection = True
 
             return
 
@@ -14029,40 +16411,78 @@ class Handler(BaseHTTPRequestHandler):
                     content_type = "audio/mpeg"
                     download_name = "download.mp3"
 
-                self.send_response(200)
+                range_header = self.headers.get("Range", "").strip()
+                start, end = 0, size - 1
 
-                self.send_header(
-                    "Content-Type",
-                    content_type
-                )
+                if range_header:
+                    import re as regex_range
+                    match = regex_range.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
 
+                    if not match or not size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+
+                    first, last = match.groups()
+
+                    if not first and not last:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+
+                    if first:
+                        start = int(first)
+                        end = min(int(last), size - 1) if last else size - 1
+                    else:
+                        suffix_length = int(last)
+                        start = max(0, size - suffix_length)
+
+                    if start >= size or start > end or (not first and not int(last)):
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+
+
+                self.send_response(206 if range_header else 200)
+                self.send_header("Content-Type", content_type)
                 self.send_header(
                     "Content-Length",
-                    str(size)
+                    str(end - start + 1 if size else 0)
                 )
+                self.send_header("Accept-Ranges", "bytes")
+
+                if range_header:
+                    self.send_header(
+                        "Content-Range",
+                        f"bytes {start}-{end}/{size}"
+                    )
 
                 self.send_header(
                     "Content-Disposition",
                     'attachment; filename="' + download_name + '"'
                 )
-
-                self.send_header(
-                    "Access-Control-Allow-Origin",
-                    "*"
-                )
-
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
+
                 with file_path.open("rb") as source:
+                    source.seek(start)
+                    remaining = end - start + 1 if size else 0
 
-                    while True:
-
-                        chunk = source.read(1024 * 1024)
+                    while remaining > 0:
+                        chunk = source.read(min(1024 * 1024, remaining))
 
                         if not chunk:
                             break
 
                         self.wfile.write(chunk)
+                        remaining -= len(chunk)
 
                 return
 
@@ -14072,9 +16492,12 @@ class Handler(BaseHTTPRequestHandler):
 
             except Exception as error:
 
+                import traceback
+                traceback.print_exc()
                 print(
                     "ERROR /api/download-mobile-file:",
-                    repr(error)
+                    repr(error),
+                    flush=True
                 )
 
                 return
@@ -14131,6 +16554,149 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(
             self.path
         )
+
+        # SHAZAMIO_SERVIDOR_PRINCIPAL_V1
+        if parsed.path == "/api/recognize-music":
+
+            import tempfile
+
+            recognizer = "shazamio"
+
+            content_type = self.headers.get(
+                "Content-Type", ""
+            ).split(";")[0].strip().lower()
+
+            if content_type not in (
+                "audio/mp4", "audio/aac", "audio/3gpp"
+            ):
+                self.send_json({
+                    "ok": False,
+                    "error": "Formato de audio no admitido."
+                }, 415)
+                return
+
+            try:
+                length = int(
+                    self.headers.get("Content-Length", "0")
+                )
+            except ValueError:
+                length = 0
+
+            if length <= 0 or length > 3 * 1024 * 1024:
+                self.send_json({
+                    "ok": False,
+                    "error": "Tamaño de grabación no válido."
+                }, 413)
+                return
+
+            if not SHAZAM_RECOGNITION_SEMAPHORE.acquire(
+                blocking=False
+            ):
+                self.send_json({
+                    "ok": False,
+                    "error": "Reconocimiento ocupado."
+                }, 429)
+                return
+
+            try:
+                audio = self.rfile.read(length)
+
+                if len(audio) != length:
+                    raise ValueError("Grabación incompleta.")
+
+                if recognizer == "shazamio":
+
+                    with tempfile.TemporaryDirectory(
+                        prefix="music-recognition-"
+                    ) as folder:
+
+                        audio_path = os.path.join(
+                            folder, "grabacion.m4a"
+                        )
+
+                        with open(audio_path, "wb") as output:
+                            output.write(audio)
+
+                        process = subprocess.run(
+                            [
+                                "/opt/music-downloader/shazam-venv/bin/python",
+                                "/opt/music-downloader/web/shazam_recognizer.py",
+                                audio_path
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=29
+                        )
+
+                        if process.returncode != 0:
+                            print(
+                                "SHAZAMIO ERROR:",
+                                process.stderr[-1500:],
+                                flush=True
+                            )
+                            raise RuntimeError(
+                                "ShazamIO no pudo procesar el audio."
+                            )
+
+                        result = json.loads(process.stdout)
+
+                if result.get("status") != "success":
+                    self.send_json({
+                        "ok": False,
+                        "error": "Error de reconocimiento."
+                    }, 502)
+                    return
+
+                song = result.get("result")
+
+                if not isinstance(song, dict):
+                    self.send_json({
+                        "ok": False,
+                        "recognized": False,
+                        "message": "Canción no identificada."
+                    })
+                    return
+
+                artist = str(
+                    song.get("artist") or ""
+                ).strip()
+
+                title = str(
+                    song.get("title") or ""
+                ).strip()
+
+                if not artist or not title:
+                    self.send_json({
+                        "ok": False,
+                        "recognized": False,
+                        "message": "Canción no identificada."
+                    })
+                    return
+
+                self.send_json({
+                    "ok": True,
+                    "recognized": True,
+                    "artist": artist,
+                    "title": title,
+                    "query": artist + " " + title
+                })
+
+            except Exception as error:
+                print(
+                    "MUSIC RECOGNITION ERROR:",
+                    type(error).__name__,
+                    flush=True
+                )
+
+                self.send_json({
+                    "ok": False,
+                    "error": "No se pudo identificar la canción."
+                }, 502)
+
+            finally:
+                SHAZAM_RECOGNITION_SEMAPHORE.release()
+
+            return
 
         if parsed.path == "/api/history/clear":
 
