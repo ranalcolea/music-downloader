@@ -12673,60 +12673,200 @@ def save_spotify_lists(lists):
         return False
 
 
+# SPOTIFY_URL_AUTO_SYNC_V1
+SPOTIFY_SYNC_LOCK = threading.RLock()
+
 def save_spotify_playlist(result):
-    if not isinstance(result, dict):
-        return
-
-    tracks = result.get("tracks", [])
-
-    if not isinstance(tracks, list):
-        tracks = []
-
-    name = str(
-        result.get("name") or "Playlist"
-    ).strip()
-
+    if not isinstance(result, dict): return None
+    tracks = result.get('tracks') or []
+    if not isinstance(tracks, list): tracks = []
+    name = str(result.get('name') or 'Playlist').strip()
+    url = str(result.get('url') or result.get('spotify_url') or '').strip()
     from datetime import datetime
+    now = datetime.now().isoformat(timespec='seconds')
+    record = dict(id=os.urandom(8).hex(), name=name, created_at=now,
+                  count=len(tracks), tracks=tracks, source='spotify_url' if url else 'file')
+    if url: record.update(url=url, spotify_url=url, last_checked=now)
+    with SPOTIFY_SYNC_LOCK:
+        lists = load_spotify_lists()
+        for i, old in enumerate(lists):
+            old_url = str(old.get('url') or old.get('spotify_url') or '').strip()
+            same = (url and url == old_url) or (not url and not old_url and
+                    str(old.get('name', '')).strip().casefold() == name.casefold())
+            if same:
+                record['id'] = old.get('id', record['id'])
+                record['created_at'] = old.get('created_at', now)
+                lists[i] = record
+                break
+        else: lists.insert(0, record)
+        if not save_spotify_lists(lists[:100]): raise IOError('No se pudo guardar la lista')
+    return record
 
-    playlist = {
-        "id": os.urandom(8).hex(),
-        "name": name,
-        "created_at": datetime.now().isoformat(
-            timespec="seconds"
-        ),
-        "count": len(tracks),
-        "tracks": tracks
-    }
+# SPOTIFY_CSV_URL_EDITOR_V2
+# La URL vive DENTRO del registro de la lista, no en un fichero aparte.
+def spotify_update_saved_playlist_url(playlist_id, supplied_url):
+    playlist_id = str(playlist_id or '').strip()
+    raw = str(supplied_url or '').strip()
+    if not playlist_id or len(playlist_id) > 128:
+        raise ValueError('Identificador de lista no válido')
+    if len(raw) > 700:
+        raise ValueError('URL demasiado larga')
+    canonical = ''
+    if raw:
+        address = urllib.parse.urlsplit(raw)
+        host = (address.hostname or '').lower()
+        if address.scheme.lower() != 'https' or host not in (
+                'open.spotify.com', 'www.open.spotify.com'):
+            raise ValueError('Introduce un enlace https de Spotify')
+        if address.port not in (None, 443) or address.username or address.password:
+            raise ValueError('La URL de Spotify no es válida')
+        segments = [s for s in address.path.split('/') if s]
+        if (len(segments) != 2 or segments[0].lower() != 'playlist'
+                or not re.fullmatch(r'[A-Za-z0-9]{15,64}', segments[1])):
+            raise ValueError('La URL debe ser de una playlist de Spotify')
+        canonical = 'https://open.spotify.com/playlist/' + segments[1]
+    with SPOTIFY_SYNC_LOCK:
+        lists = load_spotify_lists()
+        idx = next((i for i, item in enumerate(lists)
+                    if str(item.get('id', '')) == playlist_id), None)
+        if idx is None:
+            raise ValueError('Lista no encontrada')
+        if canonical:
+            for item in lists:
+                other_id = str(item.get('id', ''))
+                if other_id == playlist_id:
+                    continue
+                other = str(item.get('url') or item.get('spotify_url') or '').strip()
+                other_id_spotify = re.search(r'/playlist/([A-Za-z0-9]+)', other)
+                if other_id_spotify and canonical.endswith('/' + other_id_spotify.group(1)):
+                    raise ValueError('Esta URL ya pertenece a otra lista guardada')
+        current = dict(lists[idx]); old = str(current.get('url') or current.get('spotify_url') or '')
+        if canonical:
+            current['url'] = canonical
+            current['spotify_url'] = canonical
+            current['source'] = 'spotify_url'
+            if canonical != old:
+                current.pop('last_checked', None)
+                current.pop('last_changed', None)
+        else:
+            current.pop('url', None)
+            current.pop('spotify_url', None)
+            current.pop('last_checked', None)
+            current.pop('last_changed', None)
+            current['source'] = 'file'
+        # NO modificar tracks, count, id ni name al vincular/desvincular.
+        lists[idx] = current
+        if not save_spotify_lists(lists):
+            raise IOError('No se pudo guardar la vinculación')
+    return {'ok': True, 'id': playlist_id, 'url': canonical,
+            'linked': bool(canonical), 'changed': old != canonical}
 
-    lists = load_spotify_lists()
+# SPOTIFY_ARCHIVO_LUEGO_URL_V8
+# Eliminar confirmaciones y snapshots previos: menos pistas de Spotify => no tocar.
+def spotify_sync_existing_playlist(playlist_id, confirmation_token=""):
+    from collections import Counter
+    from datetime import datetime
+    if confirmation_token:
+        return {"ok": False, "status": "protected", "changed": False,
+                "error": "Las listas incompletas ya no se pueden forzar"}
+    with SPOTIFY_SYNC_LOCK:
+        items = load_spotify_lists()
+        row = next((x for x in items if str(x.get("id", "")) == str(playlist_id)), None)
+        if row is None:
+            raise ValueError("Playlist no encontrada")
+        url = str(row.get("url") or row.get("spotify_url") or "").strip()
+    if not url:
+        return {"ok": True, "status": "static", "changed": False}
+    try:
+        remote = spotify_parse_spotify_url(url)
+    except Exception as error:
+        return {"ok": False, "status": "unavailable", "changed": False,
+                "error": str(error)[:200]}
+    tracks = remote.get("tracks") or []
+    if not isinstance(tracks, list) or not tracks:
+        return {"ok": False, "status": "unavailable", "changed": False,
+                "error": "Spotify no devolvió canciones válidas"}
+    with SPOTIFY_SYNC_LOCK:
+        items = load_spotify_lists()
+        idx = next((i for i, x in enumerate(items)
+                    if str(x.get("id", "")) == str(playlist_id)), None)
+        if idx is None: raise ValueError("Lista guardada no encontrada")
+        row = dict(items[idx])
+        if str(row.get("url") or row.get("spotify_url") or "").strip() != url:
+            return {"ok": False, "status": "unavailable", "changed": False,
+                    "error": "La URL cambió durante la comprobación"}
+        old = row.get("tracks") or []
+        old_count = len(old)
+        new_count = len(tracks)
+        if new_count < old_count:
+            print("SPOTIFY V8: URL devuelve menos canciones:", new_count,
+                  "de", old_count, "- lista protegida, SIN actualizar", flush=True)
+            return {"ok": False, "status": "protected", "changed": False,
+                    "saved_count": old_count, "received_count": new_count,
+                    "error": "Spotify devuelve menos canciones. Se protege tu lista."}
+        def key(t):
+            return (_spotify_normalize(str(t.get("title") or "")),
+                    _spotify_normalize(str(t.get("artist") or "")))
+        before = [key(x) for x in old]
+        after = [key(x) for x in tracks]
+        bcount, acount = Counter(before), Counter(after)
+        added = sum((acount-bcount).values())
+        removed = sum((bcount-acount).values())
+        reordered = before != after and not added and not removed
+        changed = before != after
+        row["last_checked"] = datetime.now().isoformat(timespec="seconds")
+        if changed:
+            row["tracks"] = tracks
+            row["count"] = new_count
+            row["last_changed"] = row["last_checked"]
+        items[idx] = row
+        if not save_spotify_lists(items):
+            return {"ok": False, "status": "write_error", "changed": False,
+                    "error": "No se guardaron los cambios"}
+        return {"ok": True, "status": "updated" if changed else "unchanged",
+                "changed": changed, "added": added, "removed": removed,
+                "reordered": reordered, "count": new_count}
 
-    # Si ya existe una playlist con el mismo nombre,
-    # sustituimos su contenido por la versión nueva.
-    replaced = False
 
-    for index, old in enumerate(lists):
-        if str(
-            old.get("name", "")
-        ).strip().lower() == name.lower():
-
-            playlist["id"] = old.get(
-                "id",
-                playlist["id"]
-            )
-
-            lists[index] = playlist
-            replaced = True
-            break
-
-    if not replaced:
-        lists.insert(0, playlist)
-
-    # Las más recientes primero.
-    lists = lists[:100]
-
-    save_spotify_lists(lists)
-
-    return playlist
+def spotify_v8_update_from_local_file(playlist_id, filename, content):
+    """Actualiza la MISMA lista sin cambiar id/name/URL. No crea copias de listas."""
+    import hashlib
+    if not isinstance(content, str) or len(content.encode("utf-8")) > 3_000_000:
+        raise ValueError("El archivo excede el límite de 3 MB")
+    if Path(filename).suffix.lower() not in (".csv", ".txt", ".json"):
+        raise ValueError("Selecciona un CSV, TXT o JSON")
+    parsed = spotify_parse_playlist(filename, content)
+    tracks = parsed.get("tracks") or []
+    if not isinstance(tracks, list) or not (1 <= len(tracks) <= 5000):
+        raise ValueError("Archivo sin canciones válidas o con más de 5000")
+    if any(not isinstance(t, dict) or not str(t.get("title") or "").strip()
+           for t in tracks):
+        raise ValueError("Archivo con alguna canción sin título")
+    with SPOTIFY_SYNC_LOCK:
+        items = load_spotify_lists()
+        idx = next((i for i, x in enumerate(items)
+                    if str(x.get("id", "")) == str(playlist_id)), None)
+        if idx is None: raise ValueError("Lista guardada no encontrada")
+        old = dict(items[idx])
+        old_tracks = old.get("tracks") or []
+        def keys(all_tracks):
+            return [(_spotify_normalize(str(t.get("title") or "")),
+                     _spotify_normalize(str(t.get("artist") or ""))) for t in all_tracks]
+        changed = keys(old_tracks) != keys(tracks)
+        if changed:
+            old["tracks"] = tracks
+            old["count"] = len(tracks)
+            from datetime import datetime
+            old["last_changed"] = datetime.now().isoformat(timespec="seconds")
+            # Conserva nombre, ID, URL y todos los metadatos ajenos.
+            items[idx] = old
+            if not save_spotify_lists(items):
+                raise IOError("No se pudieron guardar las canciones")
+        print("SPOTIFY V8: archivo comprobado, lista", playlist_id,
+              len(old_tracks), "->", len(tracks),
+              "cambiada" if changed else "sin cambios", flush=True)
+        return {"ok": True, "status": "updated" if changed else "unchanged",
+                "changed": changed, "count": len(tracks), "old_count": len(old_tracks)}
 
 
 def spotify_parse_spotify_url(url):
@@ -16773,6 +16913,94 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
+        # SPOTIFY_URL_AUTO_SYNC_V1
+        if parsed.path == "/api/spotify/list/sync":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if not 0 < length <= 8192: raise ValueError("Peticion invalida")
+                body = json.loads(self.rfile.read(length))
+                result = spotify_sync_existing_playlist(
+                    str(body.get("id", "")),
+                    str(body.get("confirmation_token", "")))
+                self.send_json(result)
+            except ValueError as e:
+                self.send_json({"error": str(e)}, 400)
+            except Exception as e:
+                print("SPOTIFY SYNC ERROR:", repr(e), flush=True)
+                self.send_json({"error": "Error comprobando Spotify"}, 500)
+            return
+
+        # SPOTIFY_CSV_URL_EDITOR_V2: editar el vínculo sin sustituir el CSV.
+        if parsed.path == "/api/spotify/list/url":
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                if length < 1 or length > 4096:
+                    raise ValueError('Petición de vinculación no válida')
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ValueError('Petición incorrecta')
+                result = spotify_update_saved_playlist_url(
+                    data.get('id', ''), data.get('url', ''))
+                self.send_json(result)
+            except (ValueError, TypeError) as error:
+                self.send_json({'error': str(error)}, 400)
+            except Exception as error:
+                print('SPOTIFY URL EDIT ERROR:', repr(error), flush=True)
+                self.send_json({'error': 'No se pudo guardar la URL'}, 500)
+            return
+
+        # SPOTIFY_PERSONAL_URL_V3: consulta de solo lectura, NO guarda ni importa listas.
+        if parsed.path == "/api/spotify/url/preview":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 2048:
+                    raise ValueError("Petición inválida")
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("Datos inválidos")
+                raw = str(body.get("url", "")).strip()
+                address = urllib.parse.urlsplit(raw)
+                if (address.scheme.lower() != "https"
+                        or (address.hostname or "").lower() not in
+                            ("open.spotify.com", "www.open.spotify.com")
+                        or address.port not in (None, 443)
+                        or address.username or address.password):
+                    raise ValueError("URL de Spotify no válida")
+                match = re.fullmatch(r"/playlist/([A-Za-z0-9]{15,64})/?", address.path)
+                if not match:
+                    raise ValueError("Enlace de playlist de Spotify no válido")
+                canonical = "https://open.spotify.com/playlist/" + match.group(1)
+                result = spotify_parse_spotify_url(canonical)
+                if not isinstance(result.get("tracks"), list) or not result["tracks"]:
+                    raise ValueError("Spotify no devolvió canciones")
+                self.send_json(result)
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                self.send_json({"error": str(error)}, 400)
+            except Exception as error:
+                print("SPOTIFY PREVIEW ERROR:", repr(error), flush=True)
+                self.send_json({"error": "Spotify no disponible"}, 503)
+            return
+
+        # SPOTIFY_ARCHIVO_LUEGO_URL_V8: contenido CSV/TXT/JSON del móvil.
+        if parsed.path == "/api/spotify/list/file/update":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= length <= 6_000_000:
+                    raise ValueError("Petición demasiado grande o vacía")
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("Contenido incorrecto")
+                result = spotify_v8_update_from_local_file(
+                    str(body.get("id", "")),
+                    str(body.get("filename", "")), body.get("content", ""))
+                self.send_json(result)
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                self.send_json({"error": str(error)}, 400)
+            except Exception as error:
+                print("SPOTIFY V8 FILE ERROR:", repr(error), flush=True)
+                self.send_json({"error": "No se pudo actualizar la lista"}, 500)
+            return
+
         if parsed.path == "/api/spotify/list/load":
 
             length = int(
@@ -16935,9 +17163,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 if saved_playlist:
-                    result["saved_id"] = (
-                        saved_playlist.get("id")
-                    )
+                    result["saved_id"] = saved_playlist.get("id")
+                    result["id"] = saved_playlist.get("id")
 
                 self.send_json(
                     result
