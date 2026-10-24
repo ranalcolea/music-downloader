@@ -12686,6 +12686,10 @@ def save_spotify_playlist(result):
     now = datetime.now().isoformat(timespec='seconds')
     record = dict(id=os.urandom(8).hex(), name=name, created_at=now,
                   count=len(tracks), tracks=tracks, source='spotify_url' if url else 'file')
+    # SPOTIFY_LIST_BADGE_V1: formato original de la importación.
+    import_origin = str(result.get('import_origin') or '').strip().lower()
+    if import_origin in ('csv', 'txt', 'json', 'url'):
+        record['import_origin'] = import_origin
     if url: record.update(url=url, spotify_url=url, last_checked=now)
     with SPOTIFY_SYNC_LOCK:
         lists = load_spotify_lists()
@@ -12696,6 +12700,12 @@ def save_spotify_playlist(result):
             if same:
                 record['id'] = old.get('id', record['id'])
                 record['created_at'] = old.get('created_at', now)
+                # Preservar el origen inicial en sustituciones de listas.
+                prior_origin = str(old.get('import_origin') or '').strip().lower()
+                if prior_origin:
+                    record['import_origin'] = prior_origin
+                else:
+                    record.pop('import_origin', None)  # históricos: origen exacto desconocido
                 lists[i] = record
                 break
         else: lists.insert(0, record)
@@ -17158,6 +17168,12 @@ class Handler(BaseHTTPRequestHandler):
                         content
                     )
 
+                # SPOTIFY_LIST_BADGE_V1: guardar extensión real o URL inicial.
+                if isinstance(result, dict):
+                    result['import_origin'] = (
+                        'url' if spotify_url
+                        else Path(filename).suffix.lower().lstrip('.')
+                    )
                 saved_playlist = save_spotify_playlist(
                     result
                 )
