@@ -12702,10 +12702,13 @@ def save_spotify_playlist(result):
                 record['created_at'] = old.get('created_at', now)
                 # Preservar el origen inicial en sustituciones de listas.
                 prior_origin = str(old.get('import_origin') or '').strip().lower()
-                if prior_origin:
+                # SPOTIFY_BADGE_PRESERVAR_ORIGEN_V1
+                # Si el registro anterior tenía formato conocido, respetarlo.
+                # Si no, permitir que la reimportación aporte el formato real.
+                if prior_origin in ('csv', 'txt', 'json', 'url'):
                     record['import_origin'] = prior_origin
-                else:
-                    record.pop('import_origin', None)  # históricos: origen exacto desconocido
+                elif import_origin not in ('csv', 'txt', 'json', 'url'):
+                    record.pop('import_origin', None)
                 lists[i] = record
                 break
         else: lists.insert(0, record)
